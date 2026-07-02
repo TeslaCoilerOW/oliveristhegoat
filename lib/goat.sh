@@ -79,21 +79,33 @@ goat_hr()   { printf '  %s%s%s\n' "$C_DIM" \
 
 # --- banners ----------------------------------------------------------------
 goat_banner() {  # the big one (oliveristhegoat, setup.sh)
-  local g1 g2 g3 g4 g5 g6
+  local g1 g2 g3 g4 g5 g6 b1 b2 b3 b4 b5 b6 v
+  # Two deliberately contrasting gradients: OLIVER runs cool (ice → violet),
+  # GOAT runs warm (gold → ember) — same weight, opposite temperature.
+  b1="$(_gc '150;235;255' 123 36)"; b2="$(_gc '115;205;255' 117 36)"
+  b3="$(_gc '90;170;250'  75  36)"; b4="$(_gc '100;135;245' 69  34)"
+  b5="$(_gc '130;110;240' 99  35)"; b6="$(_gc '165;95;235'  135 35)"
   g1="$(_gc '255;215;0'  220 33)"; g2="$(_gc '255;193;7'  220 33)"
   g3="$(_gc '255;170;20' 214 33)"; g4="$(_gc '255;145;40' 208 33)"
   g5="$(_gc '244;115;55' 202 31)"; g6="$(_gc '230;90;70'  196 31)"
+  v="$(cat "${GOAT_HOME:-$(dirname "${BASH_SOURCE[0]}")/..}/VERSION" 2>/dev/null || true)"
   {
     printf '\n'
-    printf '   %sO L I V E R   I S   T H E%s\n' "${C_DIM}${G_BOLD}" "$G_RST"
+    printf '   %s ██████╗ ██╗     ██╗██╗   ██╗███████╗██████╗ %s\n' "$b1" "$G_RST"
+    printf '   %s██╔═══██╗██║     ██║██║   ██║██╔════╝██╔══██╗%s\n' "$b2" "$G_RST"
+    printf '   %s██║   ██║██║     ██║██║   ██║█████╗  ██████╔╝%s\n' "$b3" "$G_RST"
+    printf '   %s██║   ██║██║     ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗%s\n' "$b4" "$G_RST"
+    printf '   %s╚██████╔╝███████╗██║ ╚████╔╝ ███████╗██║  ██║%s\n' "$b5" "$G_RST"
+    printf '   %s ╚═════╝  ╚══════╝╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝%s\n' "$b6" "$G_RST"
+    printf '   %sI S   T H E%s\n' "${C_DIM}${G_BOLD}" "$G_RST"
     printf '   %s ██████╗  ██████╗  █████╗ ████████╗%s\n' "$g1" "$G_RST"
     printf '   %s██╔════╝ ██╔═══██╗██╔══██╗╚══██╔══╝%s\n' "$g2" "$G_RST"
     printf '   %s██║  ███╗██║   ██║███████║   ██║%s   🐐\n' "$g3" "$G_RST"
     printf '   %s██║   ██║██║   ██║██╔══██║   ██║%s\n' "$g4" "$G_RST"
     printf '   %s╚██████╔╝╚██████╔╝██║  ██║   ██║%s\n' "$g5" "$G_RST"
     printf '   %s ╚═════╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝%s\n' "$g6" "$G_RST"
-    printf '   %sfrontier-scale local LLMs on MIT Engaging · Slurm handled for you%s\n\n' \
-      "$C_DIM" "$G_RST"
+    printf '   %sv%s%s %s· frontier-scale local LLMs on MIT Engaging · Slurm handled for you%s\n\n' \
+      "${C_GOLD}${G_BOLD}" "${v:-?}" "$G_RST" "$C_DIM" "$G_RST"
   } >&2
 }
 
