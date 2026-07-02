@@ -371,7 +371,7 @@ CMD_NAME="ollama-$MODE"
 CMD="$(_find_cmd "$CMD_NAME" || true)"
 if [ -z "${CMD:-}" ]; then
   goat_err "could not find '$CMD_NAME' — run the one-time setup:"
-  goat_dim "  ~/ollama-on-engaging/deliverables/setup.sh"
+  goat_dim "  $HERE/setup.sh"
   exit 1
 fi
 

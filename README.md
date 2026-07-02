@@ -1,4 +1,4 @@
-# 🐐 oliveristhegoat — local LLMs on Engaging
+# rsi-cluster — local LLMs on MIT Engaging
 
 Run a frontier-scale local LLM on H200 GPUs in **one word**. All the cluster
 details — Slurm, GPU sizing, per-user quotas, storage, networking — are handled
@@ -9,7 +9,8 @@ for you, in full color.
 ## Setup — do this once
 
 ```bash
-~/ollama-on-engaging/deliverables/setup.sh
+git clone https://github.com/TeslaCoilerOW/rsi-cluster.git ~/rsi-cluster
+~/rsi-cluster/setup.sh
 ```
 
 That's the whole setup. It puts the commands below on your PATH.
@@ -197,7 +198,7 @@ stays clean: UI goes to stderr, model answers to stdout.
 ## Staying up to date (automatic)
 
 This directory is a git clone of
-[TeslaCoilerOW/oliveristhegoat](https://github.com/TeslaCoilerOW/oliveristhegoat).
+[TeslaCoilerOW/rsi-cluster](https://github.com/TeslaCoilerOW/rsi-cluster).
 Every `oliveristhegoat` run asks GitHub for the branch's tip commit (one
 tiny request, ~0.3 s, no CDN lag) and compares it with the local clone:
 

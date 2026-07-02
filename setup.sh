@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# setup.sh -- one-time setup. Puts `oliveristhegoat`, `ollama-chat`,
-# `ollama-serve`, and `ollama-code` on your PATH so you can run them from
-# anywhere. Safe to re-run. Nothing runs on the login node and no GPU is
-# used here.
+# setup.sh -- one-time setup for rsi-cluster. Puts its commands on your
+# PATH so you can run them from anywhere. Safe to re-run. Nothing runs on
+# the login node and no GPU is used here.
 #
-#   ~/ollama-on-engaging/deliverables/setup.sh
+#   ~/rsi-cluster/setup.sh
 #
 # Undo: delete the symlinks it reports below.
 # ===========================================================================
@@ -14,7 +13,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 . "$HERE/lib/goat.sh"
 
-goat_banner
+printf '\n  %sRSI-CLUSTER%s %s· local LLMs on MIT Engaging · one-time setup%s\n\n' \
+  "${C_GOLD}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST" >&2
 
 BIN="$HOME/.local/bin"
 mkdir -p "$BIN"
