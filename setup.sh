@@ -19,11 +19,13 @@ printf '\n  %sRSI-CLUSTER%s %s· local LLMs on MIT Engaging · one-time setup%s\
 BIN="$HOME/.local/bin"
 mkdir -p "$BIN"
 
+# Link the commands quietly — the star of the show is named at the very
+# end, not in a symlink report.
 for cmd in oliveristhegoat ollama-chat ollama-serve ollama-code; do
   chmod +x "$HERE/$cmd"
   ln -sf "$HERE/$cmd" "$BIN/$cmd"
-  goat_ok "linked ${G_BOLD}$BIN/$cmd${G_RST} ${C_DIM}→ $HERE/$cmd${G_RST}"
 done
+goat_ok "linked 4 commands into ${G_BOLD}$BIN${G_RST} ${C_DIM}(remove them there to undo)${G_RST}"
 chmod +x "$HERE/lib/engaging_coder.py" 2>/dev/null || true
 
 # Pre-create the model store so the very first run has nothing to trip on.
