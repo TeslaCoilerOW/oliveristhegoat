@@ -32,13 +32,13 @@ if [ "$GOAT_COLOR_MODE" != none ]; then
 fi
 export GOAT_VIA=oliveristhegoat
 
-# Stay current: compare this VERSION with the one on GitHub and fast-forward
-# the clone when they differ, then re-run as the new version with the same
+# Stay current: ask GitHub for this branch's tip commit and fast-forward the
+# clone when GitHub is newer, then re-run as the new version with the same
 # args. Updating is MANDATORY: if GitHub has a newer version and the pull
 # fails, refuse to start rather than run stale code. Only an unreachable /
 # unknowable remote lets the current version proceed (compute nodes may be
-# offline). The guard env stops a re-exec loop if versions still mismatch
-# after a pull (e.g. the remote VERSION file and the pushed code disagree).
+# offline). The guard env stops a re-exec loop if the remote still differs
+# right after a successful pull.
 if [ -z "${GOAT_SELF_UPDATED:-}" ]; then
   _upd=0; goat_self_update || _upd=$?
   case $_upd in

@@ -625,38 +625,39 @@ goat_ensure_model() {
 }
 
 # --------------------------------------------------------------------------
-# self-update -- every oliveristhegoat run compares the local VERSION file
-# with the one on GitHub (one tiny GET, 2 s budget) and fast-forwards this
-# clone when they differ. Offline, non-clone copies, and GOAT_UPDATE=0 all
-# skip quietly -- an update must never stand between you and a GPU.
+# self-update -- every oliveristhegoat run asks GitHub for the tip commit of
+# this clone's branch (git ls-remote: one tiny request, no CDN cache, so a
+# push is seen immediately -- raw.githubusercontent lags up to 5 min) and
+# fast-forwards when GitHub has commits we don't. Local commits GitHub does
+# not have yet (development) are NOT "out of date". Offline, non-clone
+# copies, and GOAT_UPDATE=0 skip quietly -- an update check must never
+# stand between you and a GPU.
 # Return codes: 0 updated · 1 already current · 2 check skipped/unreachable
 #               3 remote is newer but the pull failed (local edits?)
 # --------------------------------------------------------------------------
 GOAT_HOME="${GOAT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-goat_remote_version() {  # VERSION file on origin's branch, via raw.githubusercontent
-  local url branch
-  url="$(git -C "$GOAT_HOME" remote get-url origin 2>/dev/null)" || return 1
-  case "$url" in git@github.com:*) url="https://github.com/${url#git@github.com:}" ;; esac
-  url="${url%.git}"
-  branch="$(git -C "$GOAT_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch=main
-  { [ -z "$branch" ] || [ "$branch" = HEAD ]; } && branch=main
-  curl -fsS --max-time "${GOAT_UPDATE_TIMEOUT:-2}" \
-    "${url/github.com/raw.githubusercontent.com}/$branch/VERSION" 2>/dev/null
-}
-
 goat_self_update() {
   [ "${GOAT_UPDATE:-1}" = 0 ] && return 2
-  command -v git >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || return 2
+  command -v git >/dev/null 2>&1 || return 2
   git -C "$GOAT_HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 2
-  local local_v remote_v
+  local branch remote_sha local_sha local_v
+  branch="$(git -C "$GOAT_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 2
+  [ "$branch" = HEAD ] && return 2   # detached checkout — leave it alone
+  remote_sha="$(GIT_TERMINAL_PROMPT=0 timeout "${GOAT_UPDATE_TIMEOUT:-5}" \
+    git -C "$GOAT_HOME" ls-remote --quiet origin "refs/heads/$branch" 2>/dev/null \
+    | awk '{print $1; exit}')" || return 2
+  [ -z "$remote_sha" ] && return 2
+  local_sha="$(git -C "$GOAT_HOME" rev-parse HEAD 2>/dev/null)" || return 2
+  [ "$remote_sha" = "$local_sha" ] && return 1
+  if git -C "$GOAT_HOME" cat-file -e "$remote_sha" 2>/dev/null \
+     && git -C "$GOAT_HOME" merge-base --is-ancestor "$remote_sha" HEAD 2>/dev/null; then
+    return 1   # we are strictly ahead of GitHub (unpushed work) — nothing to pull
+  fi
   local_v="$(cat "$GOAT_HOME/VERSION" 2>/dev/null || true)"
-  remote_v="$(goat_remote_version)" || return 2
-  [ -z "$remote_v" ] && return 2
-  [ "$remote_v" = "$local_v" ] && return 1
-  goat_step "GitHub has ${G_BOLD}v$remote_v${G_RST} (you have v${local_v:-?}) — updating…"
-  if git -C "$GOAT_HOME" pull --ff-only --quiet >/dev/null 2>&1; then
-    goat_ok "updated to v$(cat "$GOAT_HOME/VERSION" 2>/dev/null || echo "$remote_v")"
+  goat_step "GitHub has a newer version than ${G_BOLD}v${local_v:-?}${G_RST} — updating…"
+  if GIT_TERMINAL_PROMPT=0 git -C "$GOAT_HOME" pull --ff-only --quiet >/dev/null 2>&1; then
+    goat_ok "updated to ${G_BOLD}v$(cat "$GOAT_HOME/VERSION" 2>/dev/null || echo '?')${G_RST} ($(git -C "$GOAT_HOME" rev-parse --short HEAD 2>/dev/null))"
     return 0
   fi
   goat_warn "could not fast-forward (local edits or diverged history?)"
