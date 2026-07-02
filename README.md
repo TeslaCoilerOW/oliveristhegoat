@@ -188,6 +188,24 @@ launch cards, the coding CLI — with graceful fallback (truecolor → 256 → 1
 plain) and standard opt-outs: `NO_COLOR=1` or `GOAT_COLOR=0`. Piped output
 stays clean: UI goes to stderr, model answers to stdout.
 
+## Staying up to date (automatic)
+
+This directory is a git clone of
+[TeslaCoilerOW/oliveristhegoat](https://github.com/TeslaCoilerOW/oliveristhegoat).
+Every `oliveristhegoat` run asks GitHub for the branch's tip commit (one
+tiny request, ~0.3 s, no CDN lag) and compares it with the local clone:
+
+- **GitHub is newer** → the clone fast-forwards itself and re-runs your
+  exact command as the new version. Updating is **mandatory**: if the pull
+  is blocked (edited files, diverged history), it refuses to start rather
+  than run stale code.
+- **Same commit, or local is ahead** (unpushed work) → starts normally.
+- **GitHub unreachable** (e.g. an offline compute node) → starts normally.
+
+`oliveristhegoat update` checks on demand; `GOAT_UPDATE=0` skips the check
+for one run (emergency bypass). To ship a new version: commit, bump
+`VERSION`, push — everyone picks it up on their next invocation.
+
 ## Tuning (env vars)
 
 | Variable | Effect | Example |
@@ -202,6 +220,8 @@ stays clean: UI goes to stderr, model answers to stdout.
 | `GOAT_WINDOW_CPU=` | allocation window for CPU jobs (s) | default `90` |
 | `GOAT_PART_CPU=` | quick-mode partitions, asked all at once (first to grant wins) | default `mit_normal,mit_quicktest,mit_preemptable` |
 | `CODER=` | coding front-end (`engaging`/`aider`/any) | `CODER=aider ollama-code` |
+| `GOAT_UPDATE=0` | skip the GitHub self-update check this run | `GOAT_UPDATE=0 oliveristhegoat …` |
+| `GOAT_UPDATE_TIMEOUT=` | seconds allowed for the update check | default `5` |
 
 Overrides are still checked against the QOS caps — a request that can never
 start is refused, not submitted.
@@ -227,6 +247,7 @@ start is refused, not submitted.
 | Model answers slowly / on CPU | Model too big for the requested VRAM — use the auto-sizing (no `GPU=` override) or a bigger request. |
 | Quick (CPU) mode feels slow | Expected ceiling is ~1–2 tok/s: the CPU nodes are shared and memory-bandwidth-bound. Threads are already pinned to your cores (`<model>-cpu16` tag). First load of a big model from pool can take minutes; held sessions keep it in RAM between prompts. |
 | Session died on `mit_preemptable` | You were preempted by a priority job. `ollama-serve` requeues itself; for chat/code just relaunch — the model is already on disk. |
+| "must update before it runs" | GitHub has a newer version but `git pull --ff-only` failed — local edits or diverged history in the clone. Run the printed `git status`, stash/commit your changes (or `git reset --hard origin/main` to discard them), or bypass once with `GOAT_UPDATE=0`. |
 
 **Full reference and background:** see the main [`../README.md`](../README.md).
 Cluster help: `orcd-help-engaging@mit.edu`.
