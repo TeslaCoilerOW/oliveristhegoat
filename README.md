@@ -98,6 +98,12 @@ ollama-chat deepseek-r1:671b                  # frontier model on 4× H200
 ollama-chat llama3.3:70b "Explain RAG briefly."   # answer, then hold for more
 ```
 
+Chat runs in **GOAT Chat**, the bundled REPL: replies stream as rendered
+markdown, fenced code appears as syntax-highlighted editor panes with line
+numbers, reasoning-model "thinking" shows dimmed, and each reply ends with a
+token-rate footer. `GOAT_PLAIN_CHAT=1` gets you the plain `ollama run` TUI
+back.
+
 The curated list (largest published sizes — this is a cluster, use it):
 
 | Model | Params | ~VRAM (q4) | Auto-request | Partition |
@@ -224,6 +230,8 @@ for one run (emergency bypass). To ship a new version: commit, bump
 | `GOAT_UPDATE_TIMEOUT=` | seconds allowed for the update check | default `5` |
 | `GOAT_ETA_WAIT=` | when nothing is free, auto-queue if Slurm forecasts a start within this many seconds (`0` = always fail fast) | default `120` |
 | `GOAT_ETA_PROBES=` | max fallback options to ask the scheduler about | default `4` |
+| `GOAT_PLAIN_CHAT=1` | use the plain `ollama run` TUI instead of GOAT Chat | |
+| `GOAT_PLAIN_MENU=1` | numeric menus instead of arrow-key navigation | |
 
 Overrides are still checked against the QOS caps — a request that can never
 start is refused, not submitted.

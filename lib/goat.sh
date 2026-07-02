@@ -489,6 +489,7 @@ goat_launch() {
   local mode="$1" self="$2" model="$3" dtime="$4"; shift 4
 
   goat_preflight "$model" "$dtime" || exit $?
+  export GOAT_GPUS="${G_GPU:-}"   # the REPL banner shows what we ended up with
 
   local extra=()
   if [ -t 0 ] && [ -t 1 ]; then extra+=(--pty); fi
@@ -618,6 +619,7 @@ goat_launch() {
       local win=$(( best_rel + 90 ))
       G_GPU="${best_type}:${best_n}"; G_PART="$best_part"
       G_CPUS="$best_cpus"; G_MEM="$best_mem"
+      export GOAT_GPUS="$G_GPU"
       goat_ok "Slurm expects ${best_n}× ${best_type} on ${best_part} $(goat_eta_human "$best_rel") — queueing for that slot (up to ${win}s, Ctrl-C to give up)"
       [ "$best_part" = "$GOAT_PART_PREEMPT" ] && \
         goat_warn "preemptable partition: a higher-priority job can requeue this one — save work often"
@@ -646,6 +648,7 @@ goat_launch() {
   fi
 
   G_GPU="${ctype}:${cn}"
+  export GOAT_GPUS="$G_GPU"
   if [ "$ctype" != "$plan_type" ] || [ "$cn" != "$plan_n" ]; then
     goat_warn "plan was ${plan_n}× ${plan_type} — switching to ${cn}× ${ctype} ($(( cn * $(goat_gpu_vram "$ctype") )) GB VRAM, model needs ~${G_VRAM} GB) because it can start now"
   fi

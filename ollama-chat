@@ -56,10 +56,26 @@ goat_ensure_server
 goat_ensure_model "$MODEL"
 if [ "${GOAT_CPU:-0}" = 1 ]; then MODEL="$(goat_cpu_tune "$MODEL")"; fi
 
+# GOAT Chat — the bundled REPL: streamed markdown, fenced code rendered like
+# an editor pane, dimmed reasoning for thinking models, token-rate footers.
+# After a first prompt it HOLDS the allocation for follow-ups (/bye frees it);
+# piped input or ONESHOT=1 answers once and exits. GOAT_PLAIN_CHAT=1 (or a
+# node without python3) falls back to the plain `ollama run` TUI.
+PY="$(command -v python3 || command -v python || true)"
+if [ -n "$PY" ] && [ "${GOAT_PLAIN_CHAT:-0}" != 1 ]; then
+  CHAT=("$PY" "$HERE/lib/engaging_coder.py" --chat --model "$MODEL" --host "$OLLAMA_HOST")
+  if [ "${#PROMPT_ARGS[@]}" -gt 0 ]; then
+    if [ -t 0 ] && [ -t 1 ] && [ "${ONESHOT:-0}" != 1 ]; then
+      exec "${CHAT[@]}" ${PROMPT_ARGS[@]+"${PROMPT_ARGS[@]}"}
+    fi
+    exec "${CHAT[@]}" --oneshot ${PROMPT_ARGS[@]+"${PROMPT_ARGS[@]}"}
+  fi
+  exec "${CHAT[@]}"
+fi
+
+# Fallback: the plain ollama TUI (GOAT_PLAIN_CHAT=1, or no python on the node).
 if [ "${#PROMPT_ARGS[@]}" -gt 0 ]; then
   ollama run "$MODEL" "${PROMPT_ARGS[@]}"       # first prompt: answer on stdout
-  # Hold the allocation: keep chatting on this node so later prompts don't
-  # re-queue. Non-TTY (piped/scripted) runs and ONESHOT=1 answer once and exit.
   if [ -t 0 ] && [ -t 1 ] && [ "${ONESHOT:-0}" != 1 ]; then
     goat_say ""
     goat_ok "holding this allocation — next prompts are instant, no new queue"
