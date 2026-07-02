@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# ollama-code -- an agentic coding CLI backed by a big local model on
+# Engaging GPUs.
+#
+# Run FROM A LOGIN NODE, in the project directory you want to work on:
+#
+#   ollama-code                        # default: qwen3-coder:480b
+#   ollama-code qwen3-coder:480b "add tests for utils.py"
+#   ollama-code llama3.3:70b file1.py  # smaller model; extra args go to the CLI
+#
+# It sizes the GPU request to the model (respecting the per-user QOS caps:
+# 2 GPUs on mit_normal_gpu, 4 on mit_preemptable), starts Ollama on the GPU
+# node, downloads the model once, and drops you into "Engaging Coder" -- a
+# bundled Claude Code / Codex-style CLI (pure python3, zero installs) that can
+# read/edit your files and run cluster commands, asking approval each time.
+# Exit the agent to free the GPUs.
+#
+# Front-ends: CODER=engaging (default, bundled) | CODER=aider | CODER=<any
+# OpenAI-compatible CLI on PATH> (endpoint + key are exported for it).
+# Overrides: GPU= PARTITION= CPUS= MEM= TIME= WAIT=1 · NO_COLOR/GOAT_COLOR=0
+# ===========================================================================
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+HERE="$(dirname "$SELF")"
+. "$HERE/lib/goat.sh"
+
+MODEL="${1:-qwen3-coder:480b}"
+[ "$#" -gt 0 ] && shift
+CODER_ARGS=("$@")                    # files/flags/task for the agent
+
+# ---------------------------------------------------------------------------
+# Login-node half: relaunch inside a GPU allocation (keeps your CWD via
+# --chdir so the agent edits the right project on the compute node).
+# ---------------------------------------------------------------------------
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+  goat_mini_banner "ollama-code" "agentic coding on Engaging GPUs · $PWD"
+  goat_plan "$MODEL"; export OLLAMA_CODE_GPUS="$G_GPU"   # for the CLI banner
+  goat_launch code "$SELF" "$MODEL" "04:00:00" ${CODER_ARGS[@]+"${CODER_ARGS[@]}"}
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Compute-node half.
+# ---------------------------------------------------------------------------
+. "$HERE/lib/ollama-env.sh"
+if [ "${GOAT_CPU:-0}" = 1 ]; then    # quick mode: say where the hunt landed us
+  case "${SLURM_JOB_PARTITION:-}" in
+    *preempt*) goat_warn "landed on ⚡ ${SLURM_JOB_PARTITION} — a higher-priority job can requeue this session" ;;
+  esac
+fi
+goat_ensure_server
+goat_ensure_model "$MODEL"
+if [ "${GOAT_CPU:-0}" = 1 ]; then MODEL="$(goat_cpu_tune "$MODEL")"; fi
+
+# The agent reaches the model through Ollama's local endpoints on this node.
+PORT="${OLLAMA_HOST##*:}"
+export OLLAMA_API_BASE="http://127.0.0.1:${PORT}"      # aider's ollama provider
+export OPENAI_BASE_URL="http://127.0.0.1:${PORT}/v1"   # any OpenAI-compatible CLI
+export OPENAI_API_BASE="$OPENAI_BASE_URL"              # older env-var name
+export OPENAI_API_KEY="ollama"                         # required but ignored
+
+CODER="${CODER:-engaging}"
+PY="$(command -v python3 || command -v python || true)"
+
+goat_ok "ready on ${G_BOLD}$(hostname)${G_RST} — ${C_GOLD}${MODEL}${G_RST} is live on this GPU node"
+goat_dim "agent working directory: $PWD"
+
+case "$CODER" in
+  engaging|engaging-coder|builtin)
+    if [ -n "$PY" ]; then
+      exec "$PY" "$HERE/lib/engaging_coder.py" \
+           --model "$MODEL" --host "$OLLAMA_HOST" --gpus "${OLLAMA_CODE_GPUS:-}" \
+           ${CODER_ARGS[@]+"${CODER_ARGS[@]}"}
+    fi
+    goat_warn "python3 not found — falling back to aider (or: module load python)"
+    CODER="aider"
+    ;;
+esac
+
+if [ "$CODER" = "aider" ]; then
+  if command -v aider >/dev/null 2>&1; then
+    exec aider --model "ollama_chat/${MODEL}" --no-show-model-warnings \
+         ${CODER_ARGS[@]+"${CODER_ARGS[@]}"}
+  fi
+elif command -v "$CODER" >/dev/null 2>&1; then
+  exec "$CODER" ${CODER_ARGS[@]+"${CODER_ARGS[@]}"}
+fi
+
+# Nothing launchable found: leave the model running and explain how to connect.
+goat_err "coding CLI '$CODER' is not installed — but the model IS running."
+goat_dim "point any agent at it; the endpoint is already exported in this shell:"
+goat_dim "  OLLAMA_API_BASE=${OLLAMA_API_BASE}"
+goat_dim "  OPENAI_BASE_URL=${OPENAI_BASE_URL}   (OpenAI-compatible, api_key=ollama)"
+goat_dim "e.g.:  pip install --user aider-chat && aider --model ollama_chat/${MODEL}"
+goat_dim "set CODER=<your-cli> to have ollama-code launch it next time"
+exec bash   # a shell on the GPU node with the model live + env set

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# ollama-serve -- run Ollama as a long-lived API server on an Engaging GPU
+# node, then print the exact SSH tunnel command to reach it from a laptop or
+# notebook. The server keeps running after you log out (it's a batch job).
+#
+#   ollama-serve                     # just serve (pull models later)
+#   ollama-serve llama3.1:405b       # pre-download model(s), then serve
+#   ollama-serve qwen3-coder:480b deepseek-r1:671b
+#
+# The GPU request auto-sizes to the biggest model named, within the per-user
+# QOS caps (2 GPUs on mit_normal_gpu, 4 on mit_preemptable). 3-4 GPU models
+# are routed to mit_preemptable with --requeue, so the server comes back by
+# itself if it is ever preempted.
+#
+# Stop it (and free the GPUs) with the printed command:  scancel <jobid>
+#
+# Overrides: GPU= PARTITION= CPUS= MEM= TIME= LOGIN_HOST=orcd-login.mit.edu
+# Colors: automatic; disable with NO_COLOR=1 or GOAT_COLOR=0.
+# ===========================================================================
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+HERE="$(dirname "$SELF")"
+. "$HERE/lib/goat.sh"
+
+ENV_SH="$HERE/lib/ollama-env.sh"
+LOGIN_HOST="${LOGIN_HOST:-orcd-login.mit.edu}"
+MODELS_STR="$*"                                  # space-separated model list (may be empty)
+FIRST_MODEL="${1:-llama3.2:3b}"                  # used only in the example curl
+
+goat_mini_banner "ollama-serve" "long-lived Ollama API server on an Engaging GPU"
+
+# serve is GPU-only: a long-lived CPU server would hold shared cores for hours
+# at ~2 tok/s, and the sbatch template below always writes a -G line.
+if [ "${GOAT_CPU:-0}" = 1 ]; then
+  goat_err "quick (CPU) mode is not supported for serve — run the API server on GPUs."
+  goat_dim "for CPU-only inference use: GOAT_CPU=1 ollama-chat <model> [prompt]"
+  exit 2
+fi
+
+# Size to the LARGEST model requested (each arg gets a plan; keep the biggest).
+BIG_MODEL="$FIRST_MODEL"
+if [ "$#" -gt 1 ]; then
+  best_n=0; best_vram=0
+  for m in "$@"; do
+    goat_plan "$m"
+    if [ "$G_N" -gt "$best_n" ] || { [ "$G_N" -eq "$best_n" ] && [ "$G_VRAM" -gt "$best_vram" ]; }; then
+      best_n="$G_N"; best_vram="$G_VRAM"; BIG_MODEL="$m"
+    fi
+  done
+fi
+goat_preflight "$BIG_MODEL" "06:00:00" || exit $?
+
+LOGDIR="$HOME/ollama-logs"
+mkdir -p "$LOGDIR"
+JOB="$(mktemp "$LOGDIR/serve-job.XXXXXX.sbatch")"
+
+# On the preemptable partition, --requeue restarts the server automatically
+# if a higher-priority job ever takes the node.
+REQUEUE_LINES=""
+if [ "$G_PART" = "$GOAT_PART_PREEMPT" ]; then
+  REQUEUE_LINES=$'#SBATCH --requeue\n#SBATCH --open-mode=append'
+fi
+
+# Generate the batch script so this stays self-contained. It runs without
+# color (its output is a log file).
+cat >"$JOB" <<EOF
+#!/bin/bash
+#SBATCH -J ollama-serve
+#SBATCH -p ${G_PART}
+#SBATCH -G ${G_GPU}
+#SBATCH -c ${G_CPUS}
+#SBATCH --mem=${G_MEM}
+#SBATCH -t ${G_TIME}
+#SBATCH -o ${LOGDIR}/serve-%j.out
+#SBATCH -e ${LOGDIR}/serve-%j.out
+${REQUEUE_LINES}
+set -uo pipefail
+export NO_COLOR=1
+source "${ENV_SH}"
+PORT="\${OLLAMA_HOST##*:}"
+
+ollama serve &
+SERVE_PID=\$!
+until ollama list >/dev/null 2>&1; do sleep 1; done
+
+for m in ${MODELS_STR}; do
+  echo "-- pre-pulling \$m --"
+  ollama pull "\$m"
+done
+
+cat <<BANNER
+==================================================================
+ OLLAMA API SERVER READY
+   node : \$(hostname)
+   port : \$PORT   (bound to 127.0.0.1 -- localhost only)
+
+ 1) From YOUR LAPTOP, open an SSH tunnel (jumps via the login node):
+
+      ssh -N -L 11434:127.0.0.1:\$PORT -J ${USER}@${LOGIN_HOST} ${USER}@\$(hostname)
+
+ 2) Then, on your laptop, call it at http://127.0.0.1:11434 :
+
+      curl http://127.0.0.1:11434/api/generate \\
+        -d '{"model":"${FIRST_MODEL}","prompt":"hello","stream":false}'
+
+    (An OpenAI-compatible endpoint is also served at .../v1 .)
+
+ Stop the server and free the GPU(s):   scancel \$SLURM_JOB_ID
+==================================================================
+BANNER
+
+wait \$SERVE_PID     # keep the job alive until walltime or scancel
+EOF
+
+JOBID="$(sbatch --parsable "$JOB")"
+JOBID="${JOBID%%;*}"
+rm -f "$JOB"                        # sbatch keeps its own copy
+OUT="$LOGDIR/serve-${JOBID}.out"
+
+goat_ok "submitted API-server job ${G_BOLD}${JOBID}${G_RST}  (${G_PART}, ${G_GPU}, up to ${G_TIME})"
+goat_step "waiting for it to start so I can print your tunnel command"
+goat_dim "log: ${OUT} — Ctrl-C only stops waiting; the job keeps running"
+goat_say ""
+
+for i in $(seq 1 300); do
+  if [ -f "$OUT" ] && grep -q "OLLAMA API SERVER READY" "$OUT" 2>/dev/null; then
+    [ -t 2 ] && printf '\r%40s\r' '' >&2
+    sed -n '/OLLAMA API SERVER READY/,/^===*$/p' "$OUT"
+    goat_say ""
+    goat_ok "server is up — stop it anytime with: ${G_BOLD}scancel ${JOBID}${G_RST}"
+    exit 0
+  fi
+  [ -t 2 ] && printf '\r  %s▸%s waiting for the job to start ... %ss ' \
+    "${C_GOLD}${G_BOLD}" "$G_RST" "$i" >&2
+  sleep 1
+done
+
+[ -t 2 ] && printf '\n' >&2
+goat_warn "still queued after 5 min — the cluster is busy. When it starts, read:"
+goat_dim "  cat ${OUT}"
+goat_dim "check the queue with:  squeue --me      stop with:  scancel ${JOBID}"

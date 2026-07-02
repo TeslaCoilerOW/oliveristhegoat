@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# ollama-chat -- one command to chat with a local LLM on an Engaging GPU.
+#
+#   ollama-chat                        # default model, interactive chat
+#   ollama-chat deepseek-r1:671b       # any model from ollama.com/library
+#   ollama-chat llama3.2:3b "prompt"   # answer, then HOLD the node for more
+#                                      # prompts (piped/ONESHOT=1: answer+exit)
+#
+# Run it FROM A LOGIN NODE. It automatically:
+#   1. sizes the GPU request to the model (respecting the per-user QOS caps:
+#      2 GPUs on mit_normal_gpu, 4 on mit_preemptable -- bigger requests can
+#      never start, so we never make them),
+#   2. asks Slurm for the GPUs, waiting at most 2 minutes (WAIT=1 to queue),
+#   3. loads the Ollama module, stores models on your pool space,
+#   4. starts the server, downloads the model the first time,
+#   5. drops you into chat. /bye quits and frees the GPUs.
+#
+# Overrides: GPU=h200:2 PARTITION=... CPUS=... MEM=... TIME=... WAIT=1
+# Colors: automatic; disable with NO_COLOR=1 or GOAT_COLOR=0.
+# ===========================================================================
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"          # real path even when run via a PATH symlink
+HERE="$(dirname "$SELF")"
+. "$HERE/lib/goat.sh"
+
+MODEL="${1:-llama3.2:3b}"
+[ "$#" -gt 0 ] && shift
+PROMPT_ARGS=("$@")                   # anything left over = optional one-shot prompt
+
+# ---------------------------------------------------------------------------
+# Login-node half: relaunch this exact command inside a GPU allocation.
+# Execution resumes below on the compute node (where SLURM_JOB_ID is set).
+# ---------------------------------------------------------------------------
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+  goat_mini_banner "ollama-chat" "local LLM chat on an Engaging GPU"
+  if [ "${#PROMPT_ARGS[@]}" -eq 0 ] && [ ! -t 0 ]; then
+    goat_err "interactive chat needs a terminal — for scripts, pass a prompt: ollama-chat $MODEL \"...\""
+    exit 1
+  fi
+  goat_launch chat "$SELF" "$MODEL" "02:00:00" ${PROMPT_ARGS[@]+"${PROMPT_ARGS[@]}"}
+  exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# Compute-node half: we are ON a GPU node inside the allocation.
+# ---------------------------------------------------------------------------
+. "$HERE/lib/ollama-env.sh"          # module + pool storage + localhost port
+if [ "${GOAT_CPU:-0}" = 1 ]; then    # quick mode: say where the hunt landed us
+  case "${SLURM_JOB_PARTITION:-}" in
+    *preempt*) goat_warn "landed on ⚡ ${SLURM_JOB_PARTITION} — a higher-priority job can requeue this session" ;;
+  esac
+fi
+goat_ensure_server
+goat_ensure_model "$MODEL"
+if [ "${GOAT_CPU:-0}" = 1 ]; then MODEL="$(goat_cpu_tune "$MODEL")"; fi
+
+if [ "${#PROMPT_ARGS[@]}" -gt 0 ]; then
+  ollama run "$MODEL" "${PROMPT_ARGS[@]}"       # first prompt: answer on stdout
+  # Hold the allocation: keep chatting on this node so later prompts don't
+  # re-queue. Non-TTY (piped/scripted) runs and ONESHOT=1 answer once and exit.
+  if [ -t 0 ] && [ -t 1 ] && [ "${ONESHOT:-0}" != 1 ]; then
+    goat_say ""
+    goat_ok "holding this allocation — next prompts are instant, no new queue"
+    goat_dim "keep chatting below · /bye quits and frees the node"
+    goat_say ""
+    ollama run "$MODEL"
+  fi
+else
+  goat_ok "ready on ${G_BOLD}$(hostname)${G_RST} — chatting with ${C_GOLD}${MODEL}${G_RST}"
+  goat_dim "type /bye to quit — that also frees the GPU(s)"
+  goat_say ""
+  ollama run "$MODEL"                           # interactive chat
+fi

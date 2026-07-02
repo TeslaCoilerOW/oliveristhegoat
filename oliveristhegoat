@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# oliveristhegoat -- the friendly, colorful front door to local LLMs on the
+# MIT Engaging cluster.
+#
+# One word from a login node, answer a menu or two, and you're talking to a
+# frontier-scale model on H200 GPUs. Every cluster detail (Slurm, GPU counts,
+# per-user QOS caps, storage on pool, SSH tunnels) is handled for you.
+#
+#   oliveristhegoat                    menus: chat / code / serve / status
+#   oliveristhegoat chat  deepseek-r1:671b
+#   oliveristhegoat code  qwen3-coder:480b
+#   oliveristhegoat serve llama3.1:405b
+#   oliveristhegoat status             what's free on the cluster right now
+#   oliveristhegoat models             the curated model list + what's on disk
+#
+# Anything after the model is passed through (a one-shot prompt, files for
+# the coding agent). Env overrides work as documented: GPU= PARTITION= CPUS=
+# MEM= TIME= WAIT=1. Colors follow your terminal; NO_COLOR/GOAT_COLOR=0 off.
+# ===========================================================================
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+HERE="$(dirname "$SELF")"
+. "$HERE/lib/goat.sh"
+VERSION="$(cat "$HERE/VERSION" 2>/dev/null || echo dev)"
+
+# When the goat is invoked, the whole system runs in color (children included),
+# unless the user asked for no color or we have no terminal.
+if [ "$GOAT_COLOR_MODE" != none ]; then
+  export GOAT_COLOR=1 FORCE_COLOR=1
+fi
+export GOAT_VIA=oliveristhegoat
+
+# Stay current: compare this VERSION with the one on GitHub and fast-forward
+# the clone when they differ, then re-run as the new version with the same
+# args. Updating is MANDATORY: if GitHub has a newer version and the pull
+# fails, refuse to start rather than run stale code. Only an unreachable /
+# unknowable remote lets the current version proceed (compute nodes may be
+# offline). The guard env stops a re-exec loop if versions still mismatch
+# after a pull (e.g. the remote VERSION file and the pushed code disagree).
+if [ -z "${GOAT_SELF_UPDATED:-}" ]; then
+  _upd=0; goat_self_update || _upd=$?
+  case $_upd in
+    0) export GOAT_SELF_UPDATED=1
+       exec "$SELF" "$@" ;;
+    3) goat_err "GitHub has a newer version — oliveristhegoat must update before it runs"
+       goat_dim  "  see what is blocking the update:  git -C $HERE status"
+       goat_dim  "  (emergency bypass for this run:   GOAT_UPDATE=0 oliveristhegoat …)"
+       exit 1 ;;
+  esac
+fi
+
+# --------------------------------------------------------------------------
+# Curated models: name|params|~VRAM(q4)|request|partition-tag|blurb
+# (Sizing itself lives in lib/goat.sh -- this table is what the menus show.)
+# --------------------------------------------------------------------------
+MODELS=(
+  "deepseek-r1:671b|671B|420 GB|4× H200|pre|frontier reasoning"
+  "glm-5:744b|744B|460 GB|4× H200|pre|frontier generalist"
+  "qwen3-coder:480b|480B MoE|300 GB|3× H200|pre|best local coding model"
+  "llama4:maverick|400B MoE|250 GB|2× H200|std|fast multimodal generalist"
+  "llama3.1:405b|405B|250 GB|2× H200|std|largest dense Llama"
+  "llama3.3:70b|70B|50 GB|1× H200|std|great quality/speed balance"
+  "llama3.2:3b|3B|3 GB|1× L40S|std|instant smoke test"
+)
+# kimi-k2.7-code (~1T MoE, ~620 GB) does NOT fit under the 4-GPU per-user cap
+# (4x H200 = 564 GB) -- `oliveristhegoat models` explains this honestly.
+
+# Quick mode (no GPU at all): the most powerful models that stay conversational
+# on CPU cores alone. Both are MoE with ~3B ACTIVE params, so 16 cores give
+# usable speed; dense 70B-class models drop to ~1 tok/s on CPU and are not fun.
+GOAT_CPU_CHAT_MODEL="${GOAT_CPU_CHAT_MODEL:-gpt-oss:20b}"      # chat
+GOAT_CPU_CODE_MODEL="${GOAT_CPU_CODE_MODEL:-qwen3-coder:30b}"  # code
+
+_find_cmd() {
+  local name="$1"
+  if [ -x "$HERE/$name" ]; then echo "$HERE/$name"; return 0; fi
+  command -v "$name" 2>/dev/null && return 0
+  return 1
+}
+
+usage() {
+  goat_banner
+  {
+    printf '  %sUSAGE%s\n' "${C_GOLD}${G_BOLD}" "$G_RST"
+    printf '    %soliveristhegoat%s                     interactive menus\n' "$G_BOLD" "$G_RST"
+    printf '    %soliveristhegoat%s <mode> [model] [args...]\n\n' "$G_BOLD" "$G_RST"
+    printf '  %sMODES%s\n' "${C_GOLD}${G_BOLD}" "$G_RST"
+    printf '    %schat%s    [model] [prompt]   talk to a model (interactive, or one-shot)\n'  "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '    %scode%s    [model] [files]    agentic coding CLI in your project dir\n'      "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '    %sserve%s   [model...]         long-lived API server + SSH tunnel command\n'  "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '    %sstatus%s                     free GPUs, your jobs, model disk usage\n'      "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '    %smodels%s                     curated model list + what is downloaded\n'     "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '    %supdate%s                     fetch the newest version from GitHub now\n'    "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '    %shelp%s                       this help\n\n'                                 "${C_INFO}${G_BOLD}" "$G_RST"
+    printf '  %sEXAMPLES%s\n' "${C_GOLD}${G_BOLD}" "$G_RST"
+    printf '    oliveristhegoat chat deepseek-r1:671b\n'
+    printf '    oliveristhegoat chat llama3.3:70b "explain RAG in two sentences"\n'
+    printf '    oliveristhegoat code qwen3-coder:480b\n'
+    printf '    GOAT_CPU=1 oliveristhegoat chat gpt-oss:20b  %s# quick: CPU only, zero GPU wait%s\n' "$C_DIM" "$G_RST"
+    printf '    WAIT=1 oliveristhegoat chat glm-5:744b     %s# queue instead of hunting%s\n\n' "$C_DIM" "$G_RST"
+    printf '  %sQUICK vs POWERFUL%s (chat/code menus ask; env GOAT_CPU=1 forces quick)\n' "${C_GOLD}${G_BOLD}" "$G_RST"
+    printf '    quick    = CPU-only job asked of every CPU partition at once — the first\n'
+    printf '               that can host it wins (%s), so it\n' "${GOAT_PART_CPU//,/ · }"
+    printf '               starts in seconds · ~1-5 tok/s · best no-GPU models:\n'
+    printf '               %s (chat) · %s (code)\n' "$GOAT_CPU_CHAT_MODEL" "$GOAT_CPU_CODE_MODEL"
+    printf '    powerful = frontier models on GPUs via the exact-fit hunt\n'
+    printf '    after the first prompt the allocation is HELD for follow-ups (/bye frees it)\n\n'
+    printf '  %sTUNING (env vars)%s\n' "${C_GOLD}${G_BOLD}" "$G_RST"
+    printf '    GPU=h200:2  PARTITION=mit_preemptable  CPUS=16  MEM=128G  TIME=04:00:00\n'
+    printf '    WAIT=1 (queue instead of hunting) · GOAT_CPU=1 (quick/CPU mode)\n'
+    printf '    ONESHOT=1 (answer once and exit, do not hold) · NO_COLOR / GOAT_COLOR=0\n'
+    printf '    GOAT_UPDATE=0 (skip the GitHub version check this run)\n\n'
+    printf '  %sCLUSTER LIMITS (why you cannot have 8× H200)%s\n' "${C_GOLD}${G_BOLD}" "$G_RST"
+    printf '    per-user QOS caps: %s2 GPUs%s on mit_normal_gpu (6 h max) and %s4 GPUs%s on\n' "$G_BOLD" "$G_RST" "$G_BOLD" "$G_RST"
+    printf '    mit_preemptable (2 d max, can be requeued). Bigger requests pend forever,\n'
+    printf '    so these tools size every model to the largest request that can start.\n\n'
+  } >&2
+}
+
+# --------------------------------------------------------------------------
+# status -- live cluster dashboard
+# --------------------------------------------------------------------------
+show_status() {
+  goat_banner
+  local part free total type line
+
+  printf '  %sGPUs free right now%s  %s(free / total)%s\n' "${C_GOLD}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST" >&2
+  for part in "$GOAT_PART_NORMAL" "$GOAT_PART_PREEMPT"; do
+    local tag="${C_OK}never preempted · 6 h max${G_RST}"
+    [ "$part" = "$GOAT_PART_PREEMPT" ] && tag="${C_MAG}⚡ preemptable · 2 d max${G_RST}"
+    printf '    %s%-16s%s %s\n' "$G_BOLD" "$part" "$G_RST" "$tag" >&2
+    while read -r type free total; do
+      [ -z "${type:-}" ] && continue
+      local col="$C_WARN"; [ "${free:-0}" -gt 0 ] && col="$C_OK"
+      printf '      %s%-16s%s %s%3d%s / %-4d %s\n' \
+        "$C_INFO" "$type" "$G_RST" "${col}${G_BOLD}" "$free" "$G_RST" "$total" \
+        "$(goat_bar "$free" "$total")" >&2
+    done < <(goat_gpu_overview "$part")
+  done
+
+  printf '\n  %sYour per-user caps%s   %s2 GPUs%s on %s · %s4 GPUs%s on %s\n' \
+    "${C_GOLD}${G_BOLD}" "$G_RST" "$G_BOLD" "$G_RST" "$GOAT_PART_NORMAL" \
+    "$G_BOLD" "$G_RST" "$GOAT_PART_PREEMPT" >&2
+  printf '  %sBiggest possible%s     2× H200 = 282 GB (fast) · 4× H200 = 564 GB (preemptable)\n' \
+    "${C_GOLD}${G_BOLD}" "$G_RST" >&2
+
+  printf '\n  %sYour jobs%s\n' "${C_GOLD}${G_BOLD}" "$G_RST" >&2
+  local jobs
+  jobs="$(squeue --me --noheader -o '    %10i  %16P  %12j  %8T  %10M  %b' 2>/dev/null | head -10)"
+  if [ -n "$jobs" ]; then
+    printf '%s\n' "$jobs" >&2
+    goat_dim "free a GPU with: scancel <jobid>"
+  else
+    goat_dim "none running — GPUs are only held while a goat command is active"
+  fi
+
+  if [ -r "$HOME/orcd/.quota" ]; then
+    printf '\n  %sModel storage (pool)%s\n' "${C_GOLD}${G_BOLD}" "$G_RST" >&2
+    awk '/^ POOL/ {printf "    %.1f GB used of %.0f GB\n", $3, $5}' "$HOME/orcd/.quota" >&2 || true
+  fi
+  printf '\n' >&2
+}
+
+goat_bar() {  # goat_bar <free> <total> -> small colored usage bar
+  local free="$1" total="$2" width=14 nfree
+  [ "$total" -le 0 ] && { printf ''; return; }
+  nfree=$(( free * width / total )); [ "$free" -gt 0 ] && [ "$nfree" -eq 0 ] && nfree=1
+  printf '%s' "$C_OK"
+  local i; for i in $(seq 1 "$nfree"); do printf '█'; done
+  printf '%s' "$C_DIM"
+  for i in $(seq 1 $(( width - nfree )) ); do printf '░'; done
+  printf '%s' "$G_RST"
+}
+
+# --------------------------------------------------------------------------
+# models -- curated table + install state
+# --------------------------------------------------------------------------
+model_installed() {  # llama3.1:405b -> 0 if its manifest exists on pool
+  local name="${1%%:*}" tag="${1##*:}"
+  [ "$name" = "$1" ] && tag="latest"
+  [ -e "${OLLAMA_MODELS:-$HOME/orcd/pool/ollama/models}/manifests/registry.ollama.ai/library/${name}/${tag}" ]
+}
+
+show_models() {
+  goat_banner
+  local h200_std h200_pre row name params vram gpus ptag blurb
+  h200_std="$(goat_free_gpus h200 "$GOAT_PART_NORMAL")"
+  h200_pre="$(goat_free_gpus h200 "$GOAT_PART_PREEMPT")"
+
+  printf '  %sCurated models%s %s(largest published sizes — this is a cluster, use it)%s\n\n' \
+    "${C_GOLD}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST" >&2
+  printf '    %s%-18s %-9s %-8s %-9s %-12s %s%s\n' "$C_DIM" \
+    "MODEL" "PARAMS" "VRAM" "REQUEST" "PARTITION" "" "$G_RST" >&2
+  for row in "${MODELS[@]}"; do
+    IFS='|' read -r name params vram gpus ptag blurb <<<"$row"
+    local pcol pname mark=" "
+    if [ "$ptag" = pre ]; then pcol="$C_MAG"; pname="preemptable"; else pcol="$C_OK"; pname="fast (6h)"; fi
+    model_installed "$name" && mark="${C_OK}●${G_RST}"
+    printf '    %b %s%-18s%s %-9s %-8s %s%-9s%s %b%-12s%b %s%s%s\n' \
+      "$mark" "$G_BOLD" "$name" "$G_RST" "$params" "$vram" \
+      "$C_GOLD" "$gpus" "$G_RST" "$pcol" "$pname" "$G_RST" "$C_DIM" "$blurb" "$G_RST" >&2
+  done
+  printf '\n    %s●%s already downloaded to your pool space (starts fastest)\n' "$C_OK" "$G_RST" >&2
+  printf '    %sfree H200s now: %s in %s · %s in %s%s\n' "$C_DIM" \
+    "$h200_std" "$GOAT_PART_NORMAL" "$h200_pre" "$GOAT_PART_PREEMPT" "$G_RST" >&2
+  printf '\n  %sNot offered:%s kimi-k2.7-code (~1T MoE, ~620 GB) — it needs 5+ H200s and the\n' "${C_WARN}${G_BOLD}" "$G_RST" >&2
+  printf '  per-user cap is 4 GPUs (564 GB), so that request would pend forever.\n' >&2
+  printf '  Anything else from %shttps://ollama.com/library%s works: oliveristhegoat chat <name>\n\n' "$C_INFO" "$G_RST" >&2
+}
+
+# --------------------------------------------------------------------------
+# menus
+# --------------------------------------------------------------------------
+ask_menu() {  # ask_menu <prompt> <option>... -> chosen 1-based index on stdout
+  local prompt="$1"; shift
+  local opts=("$@") i choice
+  while true; do
+    printf '\n  %s%s%s\n' "${C_GOLD}${G_BOLD}" "$prompt" "$G_RST" >&2
+    for i in "${!opts[@]}"; do
+      printf '   %s%2d%s  %b\n' "${C_GOLD}${G_BOLD}" "$((i+1))" "$G_RST" "${opts[$i]}" >&2
+    done
+    printf '   %s Ctrl-C to cancel%s\n' "$C_DIM" "$G_RST" >&2
+    printf '  %s❯%s choose [1-%d]: ' "${C_GOLD}${G_BOLD}" "$G_RST" "${#opts[@]}" >&2
+    read -r choice || { printf '\n' >&2; exit 130; }
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ]; then
+      echo "$choice"; return 0
+    fi
+    goat_dim "please enter a number between 1 and ${#opts[@]}"
+  done
+}
+
+pick_model() {  # -> chosen model name on stdout (uses live availability tags)
+  local h200_std h200_pre l40s_std labels=() row name params vram gpus ptag blurb
+  h200_std="$(goat_free_gpus h200 "$GOAT_PART_NORMAL")"
+  h200_pre="$(goat_free_gpus h200 "$GOAT_PART_PREEMPT")"
+  l40s_std="$(goat_free_gpus l40s "$GOAT_PART_NORMAL")"
+
+  for row in "${MODELS[@]}"; do
+    IFS='|' read -r name params vram gpus ptag blurb <<<"$row"
+    local need="${gpus%%×*}" free avail
+    need="${need// /}"
+    if [ "$ptag" = pre ]; then free="$h200_pre"; else
+      case "$gpus" in *L40S*) free="$l40s_std" ;; *) free="$h200_std" ;; esac
+    fi
+    if [ "${free:-0}" -ge "${need:-1}" ]; then avail="${C_OK}● starts now${G_RST}"
+    else avail="${C_WARN}◌ will queue${G_RST}"; fi
+    [ "$ptag" = pre ] && avail="$avail ${C_MAG}⚡${G_RST}"
+    labels+=("$(printf '%s%-18s%s %s%-9s %-8s%s %s%-8s%s %b' \
+      "$G_BOLD" "$name" "$G_RST" "$C_DIM" "$params" "$vram" "$G_RST" \
+      "$C_GOLD" "$gpus" "$G_RST" "$avail")")
+  done
+  labels+=("$(printf '%stype another model%s %s(anything on ollama.com/library)%s' \
+    "$G_BOLD" "$G_RST" "$C_DIM" "$G_RST")")
+
+  local sel model
+  sel="$(ask_menu "Pick a model:" "${labels[@]}")"
+  if [ "$sel" -le "${#MODELS[@]}" ]; then
+    IFS='|' read -r model _ <<<"${MODELS[$((sel-1))]}"
+  else
+    printf '  %s❯%s exact ollama model name: ' "${C_GOLD}${G_BOLD}" "$G_RST" >&2
+    read -r model || exit 130
+    [ -z "$model" ] && { goat_err "no model entered"; exit 1; }
+  fi
+  echo "$model"
+}
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+MODE="${1:-}"
+[ "$#" -gt 0 ] && shift
+
+case "$MODE" in
+  -h|--help|help)     usage; exit 0 ;;
+  -V|--version)       goat_say "oliveristhegoat $VERSION"; exit 0 ;;
+  status|gpus|free)   show_status; exit 0 ;;
+  models|list)        show_models; exit 0 ;;
+  update|selfupdate)
+    if [ -n "${GOAT_SELF_UPDATED:-}" ]; then
+      goat_ok "oliveristhegoat v$VERSION — freshly updated and current"
+      exit 0
+    fi
+    rc=0; GOAT_UPDATE=1 goat_self_update || rc=$?
+    case $rc in
+      0) goat_ok "updated to v$(cat "$HERE/VERSION" 2>/dev/null || echo '?')" ;;
+      1) goat_ok "oliveristhegoat v$VERSION is up to date with GitHub" ;;
+      2) goat_err "could not check GitHub (offline, or this copy is not a git clone)"
+         exit 1 ;;
+      3) exit 1 ;;
+    esac
+    exit 0 ;;
+  chat|c)             MODE=chat ;;
+  code|coder)         MODE=code ;;
+  serve|server|api)   MODE=serve ;;
+  "") ;;
+  *) goat_err "unknown mode '$MODE' — use: chat | code | serve | status | models | update | help"
+     exit 1 ;;
+esac
+
+if [ -z "$MODE" ]; then
+  if [ ! -t 0 ]; then
+    goat_err "menus need a terminal — non-interactively, use: oliveristhegoat chat <model> [prompt]"
+    exit 1
+  fi
+  goat_banner
+  sel="$(ask_menu "What would you like to do?" \
+    "$(printf '%sChat%s    %s— talk to a model interactively%s'                      "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST")" \
+    "$(printf '%sCode%s    %s— agentic coding CLI in your project%s'                 "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST")" \
+    "$(printf '%sServe%s   %s— API server + SSH tunnel for laptop/notebook%s'        "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST")" \
+    "$(printf '%sStatus%s  %s— free GPUs, your jobs, storage%s'                      "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST")" \
+    "$(printf '%sModels%s  %s— the curated list and what is downloaded%s'            "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST")")"
+  case "$sel" in
+    1) MODE=chat ;;
+    2) MODE=code ;;
+    3) MODE=serve ;;
+    4) show_status; exit 0 ;;
+    5) show_models; exit 0 ;;
+  esac
+fi
+
+CMD_NAME="ollama-$MODE"
+CMD="$(_find_cmd "$CMD_NAME" || true)"
+if [ -z "${CMD:-}" ]; then
+  goat_err "could not find '$CMD_NAME' — run the one-time setup:"
+  goat_dim "  ~/ollama-on-engaging/deliverables/setup.sh"
+  exit 1
+fi
+
+MODEL="${1:-}"
+[ "$#" -gt 0 ] && shift
+if [ -z "$MODEL" ]; then
+  if [ ! -t 0 ]; then
+    goat_err "no model given — non-interactively, use: oliveristhegoat $MODE <model> [args]"
+    exit 1
+  fi
+  # Quick = CPU-only job, starts in seconds, best no-GPU model for the mode.
+  # Powerful = the curated frontier models on GPUs (exact-fit hunt).
+  # serve stays GPU-only: a long-lived CPU API server is not worth having.
+  if [ "$MODE" != serve ]; then
+    case "$MODE" in
+      code) CPU_MODEL="$GOAT_CPU_CODE_MODEL" ;;
+      *)    CPU_MODEL="$GOAT_CPU_CHAT_MODEL" ;;
+    esac
+    sel="$(ask_menu "Quick or powerful?" \
+      "$(printf '%sQuick%s     %s— starts in seconds on CPU cores, no GPU wait · %s%s' \
+        "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$CPU_MODEL" "$G_RST")" \
+      "$(printf '%sPowerful%s  %s— frontier models on GPUs (hunts for an exact fit)%s' \
+        "${C_INFO}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST")")"
+    if [ "$sel" = 1 ]; then
+      export GOAT_CPU=1
+      MODEL="$CPU_MODEL"
+      goat_dim "quick mode: ${MODEL} on CPU only — the strongest model that needs no GPU"
+    fi
+  fi
+  if [ -z "$MODEL" ]; then MODEL="$(pick_model)"; fi
+fi
+
+PASS_ARGS=("$@")
+if [ "$MODE" = chat ] && [ "${#PASS_ARGS[@]}" -eq 0 ] && [ -t 0 ]; then
+  printf '\n  %sOptional:%s first question %s(answered immediately; the node is then held for more — or press Enter for interactive chat)%s\n' \
+    "${C_GOLD}${G_BOLD}" "$G_RST" "$C_DIM" "$G_RST" >&2
+  printf '  %s❯%s ' "${C_GOLD}${G_BOLD}" "$G_RST" >&2
+  read -r oneshot || oneshot=""
+  [ -n "$oneshot" ] && PASS_ARGS=("$oneshot")
+fi
+
+printf '\n' >&2
+goat_step "launching ${G_BOLD}${CMD_NAME} ${MODEL}${G_RST}"
+goat_dim "the tool below requests the GPUs and handles everything else"
+exec "$CMD" "$MODEL" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
