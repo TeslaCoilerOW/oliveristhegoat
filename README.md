@@ -222,6 +222,8 @@ for one run (emergency bypass). To ship a new version: commit, bump
 | `CODER=` | coding front-end (`engaging`/`aider`/any) | `CODER=aider ollama-code` |
 | `GOAT_UPDATE=0` | skip the GitHub self-update check this run | `GOAT_UPDATE=0 oliveristhegoat …` |
 | `GOAT_UPDATE_TIMEOUT=` | seconds allowed for the update check | default `5` |
+| `GOAT_ETA_WAIT=` | when nothing is free, auto-queue if Slurm forecasts a start within this many seconds (`0` = always fail fast) | default `120` |
+| `GOAT_ETA_PROBES=` | max fallback options to ask the scheduler about | default `4` |
 
 Overrides are still checked against the QOS caps — a request that can never
 start is refused, not submitted.
@@ -241,7 +243,7 @@ start is refused, not submitted.
 | Symptom | Fix |
 |---|---|
 | `command not found` | Run `setup.sh` (above), then open a new shell. |
-| "nothing that fits can start within the next minute" | The hunt probed every viable GPU type/partition and found no node with the GPUs + CPUs + RAM free together. `oliveristhegoat status`, then `WAIT=1 ...` to queue, or pick a smaller model. |
+| "nothing that fits can start within the next minute" | The hunt probed every viable GPU type/partition and found no node with the GPUs + CPUs + RAM free together. It then asks Slurm's scheduler when each option *would* start: an imminent forecast (≤ `GOAT_ETA_WAIT`, default 120 s) is queued for automatically; otherwise the forecasts are printed with an exact `WAIT=1 GPU=… PARTITION=…` command for the soonest one. Forecasts are upper bounds — jobs usually end early. |
 | "no allocation within 60s (someone likely grabbed the node first)" | The node was free when probed but taken before the request landed. Just re-run — the hunt re-probes and picks whatever is free then. |
 | A job pends with `QOSMaxGRESPerUser` / `QOSMaxCpuPerUserLimit` | It asked for more than the per-user cap (2 GPUs / 32 CPUs on `mit_normal_gpu`) and will never start — `scancel` it. The goat tools never submit such requests. |
 | Model answers slowly / on CPU | Model too big for the requested VRAM — use the auto-sizing (no `GPU=` override) or a bigger request. |

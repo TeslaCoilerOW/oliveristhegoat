@@ -111,7 +111,9 @@ usage() {
     printf '    GPU=h200:2  PARTITION=mit_preemptable  CPUS=16  MEM=128G  TIME=04:00:00\n'
     printf '    WAIT=1 (queue instead of hunting) · GOAT_CPU=1 (quick/CPU mode)\n'
     printf '    ONESHOT=1 (answer once and exit, do not hold) · NO_COLOR / GOAT_COLOR=0\n'
-    printf '    GOAT_UPDATE=0 (skip the GitHub version check this run)\n\n'
+    printf '    GOAT_UPDATE=0 (skip the GitHub version check this run)\n'
+    printf '    GOAT_ETA_WAIT=120 (when nothing is free, auto-queue if Slurm forecasts\n'
+    printf '    a start within this many seconds; 0 = always fail fast)\n\n'
     printf '  %sCLUSTER LIMITS (why you cannot have 8× H200)%s\n' "${C_GOLD}${G_BOLD}" "$G_RST"
     printf '    per-user QOS caps: %s2 GPUs%s on mit_normal_gpu (6 h max) and %s4 GPUs%s on\n' "$G_BOLD" "$G_RST" "$G_BOLD" "$G_RST"
     printf '    mit_preemptable (2 d max, can be requeued). Bigger requests pend forever,\n'

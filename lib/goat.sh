@@ -360,6 +360,47 @@ goat_candidates() {
 }
 
 # --------------------------------------------------------------------------
+# Start-time forecasts -- Slurm's backfill scheduler will predict when a
+# hypothetical request would start (srun --test-only: one scheduler RPC,
+# nothing is submitted). Estimates assume running jobs use their full
+# walltime, so they are upper bounds that move earlier as jobs end -- and
+# they ignore per-user QOS caps and can be far too pessimistic when a node
+# is actually free (the live probe stays the source of truth for "now").
+# Consulted only when the hunt finds nothing free: a SHORT forecast means
+# the scheduler already has a slot reserved, so waiting for it beats
+# failing. Single partition only -- multi-partition forecasts are bogus
+# (Slurm evaluates just one of them).
+# --------------------------------------------------------------------------
+GOAT_ETA_WAIT="${GOAT_ETA_WAIT:-120}"      # queue instead of failing when the
+                                           # best forecast is <= this (s; 0=off)
+GOAT_ETA_PROBES="${GOAT_ETA_PROBES:-4}"    # max candidates to ask Slurm about
+GOAT_ETA_TIMEOUT="${GOAT_ETA_TIMEOUT:-8}"  # per-forecast budget (s)
+
+goat_eta() {  # goat_eta <partition> <cpus> <mem> <time> [gpu-type] [n]
+  # echoes "<seconds-from-now> <timestamp>" or fails if Slurm has no forecast
+  local part="$1" cpus="$2" mem="$3" tlim="$4" gt="${5:-}" gn="${6:-0}"
+  local gres=() out ts abs rel
+  case "$part" in *,*) return 1 ;; esac
+  [ "${gn:-0}" -gt 0 ] && gres=(-G "$gt:$gn")
+  out="$(timeout "$GOAT_ETA_TIMEOUT" srun --test-only -p "$part" "${gres[@]}" \
+         -c "$cpus" --mem="$mem" -t "$tlim" true 2>&1)" || return 1
+  ts="$(printf '%s\n' "$out" | sed -n 's/.*to start at \([0-9T:-]*\).*/\1/p' | head -1)"
+  [ -z "$ts" ] && return 1
+  abs="$(date -d "$ts" +%s 2>/dev/null)" || return 1
+  rel=$(( abs - $(date +%s) )); [ "$rel" -lt 0 ] && rel=0
+  printf '%s %s\n' "$rel" "$ts"
+}
+
+goat_eta_human() {  # seconds -> "right now" / "~5 m" / "~1 h 05 m" / "~1 d 2 h"
+  local s="$1"
+  if   [ "$s" -le 60 ];    then printf 'right now\n'
+  elif [ "$s" -lt 3600 ];  then printf 'in ~%d m\n' $(( (s + 59) / 60 ))
+  elif [ "$s" -lt 86400 ]; then printf 'in ~%d h %02d m\n' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  else                          printf 'in ~%d d %d h\n' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+  fi
+}
+
+# --------------------------------------------------------------------------
 # goat_preflight <model> <default-time>
 # Runs goat_plan, prints the colored launch card, refuses unrunnable requests.
 # Sets G_TIME and G_FREE in addition to goat_plan's variables.
@@ -459,6 +500,10 @@ goat_launch() {
 
   # ---- WAIT=1: the old behavior — queue indefinitely, no hunting ----------
   if [ "${WAIT:-0}" = 1 ]; then
+    local weta
+    if weta="$(goat_eta "$G_PART" "$G_CPUS" "$G_MEM" "$G_TIME" "${G_TYPE:-}" "${G_N:-0}")"; then
+      goat_step "WAIT=1 — Slurm forecasts start $(goat_eta_human "${weta%% *}") (upper bound; moves earlier as jobs finish) ..."
+    fi
     goat_step "WAIT=1 — queueing until the resources free up (Ctrl-C to give up) ..."
     goat_dim "srun -p $G_PART ${gres[*]:-} -c $G_CPUS --mem=$G_MEM -t $G_TIME"
     goat_say ""
@@ -501,9 +546,11 @@ goat_launch() {
   goat_step "hunting for an exact fit that can start right now ..."
 
   # Explicit GPU=/PARTITION= overrides mean: this request only, no ladder.
-  local src=goat_candidates
+  local cands
   if [ -n "${GPU:-}" ] || [ -n "${PARTITION:-}" ]; then
-    src=_goat_pinned; _goat_pinned() { printf '%s %s %s\n' "$plan_type" "$plan_n" "$plan_part"; }
+    cands="$plan_type $plan_n $plan_part"
+  else
+    cands="$(goat_candidates)"
   fi
 
   while read -r ctype cn cpart; do
@@ -533,12 +580,65 @@ goat_launch() {
     found=1
     goat_ok "${ctype}:${cn} on ${cpart} — ${cnt} node(s) can host this now (e.g. ${nodes%% *}) → fetching"
     break
-  done < <("$src")
-  unset -f _goat_pinned 2>/dev/null || true
+  done <<<"$cands"
 
+  # ---- nothing free NOW: ask Slurm's scheduler when each option WOULD start.
+  # A short forecast means a slot is already reserved for a request this
+  # shape — waiting those few seconds beats failing and re-running by hand.
   if [ "$found" != 1 ]; then
     goat_say ""
     goat_err "nothing that fits ${model} can start within the next minute — not queueing blindly."
+    local eta rel best_rel=-1 best_type="" best_n="" best_part="" best_cpus="" best_mem="" probes=0
+    goat_step "asking Slurm's scheduler when each option would start ..."
+    while read -r ctype cn cpart; do
+      [ "$probes" -ge "$GOAT_ETA_PROBES" ] && break
+      case "$cpart" in
+        "$GOAT_PART_PREEMPT") cap="$GOAT_CAP_PREEMPT" ;;
+        *)                    cap="$GOAT_CAP_NORMAL" ;;
+      esac
+      held="$(goat_held_gpus "$cpart")"
+      [ $(( held + cn )) -gt "$cap" ] && continue
+      _goat_tier "$ctype" "$cn" "$G_VRAM"
+      [ -n "${CPUS:-}" ] && G_CPUS="$CPUS"
+      [ -n "${MEM:-}" ]  && G_MEM="$MEM"
+      probes=$(( probes + 1 ))
+      if eta="$(goat_eta "$cpart" "$G_CPUS" "$G_MEM" "$G_TIME" "$ctype" "$cn")"; then
+        rel="${eta%% *}"
+        goat_dim "· ${ctype}:${cn} on ${cpart} — Slurm forecasts start $(goat_eta_human "$rel")"
+        if [ "$best_rel" -lt 0 ] || [ "$rel" -lt "$best_rel" ]; then
+          best_rel="$rel"; best_type="$ctype"; best_n="$cn"; best_part="$cpart"
+          best_cpus="$G_CPUS"; best_mem="$G_MEM"
+        fi
+      else
+        goat_dim "· ${ctype}:${cn} on ${cpart} — Slurm offers no forecast"
+      fi
+    done <<<"$cands"
+
+    if [ "$best_rel" -ge 0 ] && [ "$GOAT_ETA_WAIT" -gt 0 ] && [ "$best_rel" -le "$GOAT_ETA_WAIT" ]; then
+      local win=$(( best_rel + 90 ))
+      G_GPU="${best_type}:${best_n}"; G_PART="$best_part"
+      G_CPUS="$best_cpus"; G_MEM="$best_mem"
+      goat_ok "Slurm expects ${best_n}× ${best_type} on ${best_part} $(goat_eta_human "$best_rel") — queueing for that slot (up to ${win}s, Ctrl-C to give up)"
+      [ "$best_part" = "$GOAT_PART_PREEMPT" ] && \
+        goat_warn "preemptable partition: a higher-priority job can requeue this one — save work often"
+      goat_dim "srun -p $G_PART -G $G_GPU -c $G_CPUS --mem=$G_MEM -t $G_TIME"
+      goat_say ""
+      local rce=0
+      srun -p "$G_PART" -G "$G_GPU" -c "$G_CPUS" --mem="$G_MEM" -t "$G_TIME" \
+           -J "goat-${mode}" --immediate="$win" "${extra[@]}" "$self" "$model" "$@" || rce=$?
+      if [ "$rce" -ne 0 ]; then
+        goat_say ""
+        goat_err "the forecast slot did not materialize within ${win}s — estimates shift as jobs end early or new ones arrive."
+        goat_dim "  · re-run me — the hunt re-probes and re-asks the scheduler"
+        goat_dim "  · WAIT=1 ollama-${mode} ...          queue until GPUs free up"
+      fi
+      return "$rce"
+    fi
+
+    if [ "$best_rel" -ge 0 ]; then
+      goat_dim "  soonest per Slurm: ${best_n}× ${best_type} on ${best_part} $(goat_eta_human "$best_rel") — queue for exactly that:"
+      goat_dim "  · WAIT=1 GPU=${best_type}:${best_n} PARTITION=${best_part} ollama-${mode} ${model}"
+    fi
     goat_dim "  · oliveristhegoat status          see what is free right now"
     goat_dim "  · WAIT=1 ollama-${mode} ...          queue until GPUs free up"
     goat_dim "  · pick a smaller model            (e.g. llama3.3:70b → 1× H200)"
