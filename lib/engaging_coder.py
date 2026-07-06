@@ -25,6 +25,7 @@
 # ===========================================================================
 import argparse
 import difflib
+import fnmatch
 import json
 import os
 import re
@@ -45,8 +46,28 @@ except Exception:
 APP_CODER = "ENGAGING CODER"
 APP_CHAT = "GOAT CHAT"
 MAX_TOOL_OUTPUT = 6000          # chars of tool output fed back to the model
+MAX_READ_OUTPUT = 24000        # chars for read_file (bigger: whole files / ranges)
 MAX_CARD_LINES = 24             # lines shown inside file/output cards
-RUN_TIMEOUT = 180               # seconds before a shell command is killed
+DEFAULT_READ_LINES = 500        # read_file lines returned when no range is asked
+MAX_READ_LINES = 2000           # hard cap on a single read_file range
+try:
+    RUN_TIMEOUT = max(1, int(os.environ.get("GOAT_RUN_TIMEOUT") or 180))  # shell kill (s)
+except (TypeError, ValueError):
+    RUN_TIMEOUT = 180
+
+# Directories the code search / file finder never descend into (version control,
+# caches, build output, vendored deps). Keeps searches fast and — on a shared
+# cluster filesystem — considerate. Dot-directories are skipped wholesale too.
+SKIP_DIRS = frozenset((
+    ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    "env", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".cache",
+    "dist", "build", ".idea", ".vscode", "site-packages", ".ipynb_checkpoints",
+    ".ollama", ".terraform", "target", ".next", ".gradle",
+))
+SEARCH_MAX_RESULTS = 100        # matches returned by search_code
+SEARCH_MAX_FILES = 20000        # files walked before search_code/find_files stop
+FIND_MAX_RESULTS = 200          # paths returned by find_files
+MAX_SCAN_FILE_BYTES = 2_000_000  # files bigger than this are skipped when searching
 
 
 def app_version():
@@ -735,6 +756,7 @@ class Spinner:
 # --------------------------------------------------------------------------
 TOOL_DOTS = {
     "read": (P.cyan, "read"), "list": (P.cyan, "list"),
+    "search": (P.deco, "search"), "find": (P.blue, "find"),
     "write": (P.ok, "write"), "edit": (P.warn, "edit"), "run": (P.violet, "run"),
 }
 
@@ -810,7 +832,7 @@ class UI:
     def tool_dot(self, kind, detail, metric=""):
         rgb, label = TOOL_DOTS.get(kind, (P.dim, kind or "?"))
         st = self.st
-        line = "  " + st.paint(rgb, "●", bold=True) + " " + st.fg(f"{label:<5}", b=True) + " " + detail
+        line = "  " + st.paint(rgb, "●", bold=True) + " " + st.fg(f"{label:<6}", b=True) + " " + detail
         if metric:
             pad = max(2, min(term_cols(), 102) - vlen(line) - vlen(metric) - 2)
             line += " " * pad + st.faint(metric)
@@ -942,7 +964,7 @@ class UI:
         for c, d in cmds:
             print("    " + st.gold(f"{c:<16}") + st.dim(d))
         if not self.chat:
-            print("    " + st.faint("the model can read · write · edit files · run commands — with your approval"))
+            print("    " + st.faint("the model can search · read · write · edit files · run commands — with your approval"))
         print()
 
     def session_footer(self, stats):
@@ -1051,19 +1073,46 @@ def _fnschema(name, desc, props, required):
 
 
 TOOL_SCHEMA = [
-    _fnschema("read_file", "Read a UTF-8 text file and return its contents.",
-              {"path": {"type": "string", "description": "File path (relative to the working dir)."}},
+    _fnschema("read_file",
+              "Read a UTF-8 text file. Lines come back with 1-based line-number prefixes "
+              "(like `cat -n`) for reference ONLY — never copy those numbers into edit_file. "
+              "Page through large files with 'offset' (first line) and 'limit' (line count).",
+              {"path": {"type": "string", "description": "File path (relative to the working dir)."},
+               "offset": {"type": "integer", "description": "1-based line to start reading at (default 1)."},
+               "limit": {"type": "integer", "description": "Maximum lines to return (default %d)." % DEFAULT_READ_LINES}},
               ["path"]),
+    _fnschema("search_code",
+              "Search file CONTENTS across the project for a regular expression (or a literal "
+              "string when regex=false) and return matching 'path:line: text' hits. The fast "
+              "way to find a symbol, string, or definition. Skips .git, caches, build output "
+              "and binary files.",
+              {"pattern": {"type": "string", "description": "Regex (or literal, if regex=false) to search for."},
+               "path": {"type": "string", "description": "Directory or single file to search under; defaults to '.'."},
+               "glob": {"type": "string", "description": "Only search files whose name matches this glob, e.g. '*.py'."},
+               "regex": {"type": "boolean", "description": "Treat 'pattern' as a regex (default true)."},
+               "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."}},
+              ["pattern"]),
+    _fnschema("find_files",
+              "Find files by NAME across the project — a glob like '*.py' / 'test_*.py', or a "
+              "plain substring. Returns matching paths. Use it to locate where something lives "
+              "before reading it.",
+              {"pattern": {"type": "string", "description": "Filename glob or substring."},
+               "path": {"type": "string", "description": "Directory to search under; defaults to '.'."}},
+              ["pattern"]),
     _fnschema("list_dir", "List the entries of a directory.",
               {"path": {"type": "string", "description": "Directory path; defaults to '.'."}},
               []),
     _fnschema("write_file", "Create or overwrite a file with the given contents.",
               {"path": {"type": "string"}, "content": {"type": "string"}},
               ["path", "content"]),
-    _fnschema("edit_file", "Replace an exact substring in a file (all occurrences).",
+    _fnschema("edit_file",
+              "Replace text in a file. By default 'find' must occur EXACTLY ONCE — include "
+              "enough surrounding context to make it unique. Pass replace_all=true to change "
+              "every occurrence. Give 'find' verbatim; do not include read_file line numbers.",
               {"path": {"type": "string"},
-               "find": {"type": "string", "description": "Exact text to replace."},
-               "replace": {"type": "string", "description": "Replacement text."}},
+               "find": {"type": "string", "description": "Exact text to replace (verbatim, no line numbers)."},
+               "replace": {"type": "string", "description": "Replacement text."},
+               "replace_all": {"type": "boolean", "description": "Replace all occurrences instead of requiring a unique match (default false)."}},
               ["path", "find", "replace"]),
     _fnschema("run_shell", "Run a shell command in the working directory and return its output.",
               {"command": {"type": "string"}},
@@ -1084,11 +1133,93 @@ def _get(args, *keys, default=""):
     return default
 
 
+def _as_bool(val, default=False):
+    """Coerce a tool argument to bool — models send true/false, 1/0, or strings."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "y", "on")
+    return default
+
+
 def human_bytes(n):
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n / 1.0:.1f} {unit}"
         n /= 1024.0
+
+
+def _syntax_check(path, content):
+    """Mechanical post-write verification for file types we can check with the
+    stdlib alone. Returns (ok, message), or None when there is no checker for
+    this file type. Never executes the code being checked."""
+    ext = os.path.splitext(path.lower())[1]
+    if ext == ".py":
+        try:
+            compile(content, path, "exec")
+            return True, "python syntax OK"
+        except SyntaxError as e:
+            return False, f"python syntax error at line {e.lineno}: {e.msg}"
+        except (ValueError, RecursionError) as e:  # NUL bytes / pathological nesting
+            return False, f"python compile failed: {e}"
+    if ext in (".sh", ".bash", ".sbatch", ".slurm"):
+        if not shutil.which("bash"):
+            return None
+        try:
+            proc = subprocess.run(["bash", "-n", path], capture_output=True,
+                                  text=True, timeout=10)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if proc.returncode == 0:
+            return True, "bash syntax OK"
+        tail = (proc.stderr or "").strip().splitlines()
+        return False, "bash syntax error: " + (tail[-1].strip() if tail else "bash -n failed")
+    if ext == ".json":
+        try:
+            json.loads(content)
+            return True, "JSON valid"
+        except json.JSONDecodeError as e:
+            return False, f"invalid JSON at line {e.lineno}: {e.msg}"
+    return None
+
+
+def _iter_files(root, max_files=SEARCH_MAX_FILES):
+    """Yield file paths under `root`, pruning heavy/generated/dot directories.
+    Bounded by `max_files` so a huge tree can never run away on a shared FS.
+    Directory and file order is sorted, so callers get stable results."""
+    if os.path.isfile(root):
+        yield root
+        return
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in SKIP_DIRS and not d.startswith("."))
+        for name in sorted(filenames):
+            yield os.path.join(dirpath, name)
+            seen += 1
+            if seen >= max_files:
+                return
+
+
+def _read_text_lines(path):
+    """Lines of a texty file, or None if it is binary / too large / unreadable."""
+    try:
+        if os.path.getsize(path) > MAX_SCAN_FILE_BYTES:
+            return None
+        with open(path, "rb") as f:
+            chunk = f.read(MAX_SCAN_FILE_BYTES + 1)
+    except OSError:
+        return None
+    if b"\x00" in chunk:                      # NUL byte ⇒ almost certainly binary
+        return None
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return chunk.decode(enc).splitlines()
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 class ToolBox:
@@ -1114,6 +1245,8 @@ class ToolBox:
     def dispatch(self, name, args):
         handler = {
             "read_file": self.read_file,
+            "search_code": self.search_code,
+            "find_files": self.find_files,
             "list_dir": self.list_dir,
             "write_file": self.write_file,
             "edit_file": self.edit_file,
@@ -1135,11 +1268,35 @@ class ToolBox:
             self.ui.tool_dot("read", self.ui.st.fg(self._rel(p)), "no such file")
             return f"error: no such file: {self._rel(p)}"
         with open(p, "r", encoding="utf-8", errors="replace") as f:
-            body = f.read()
-        nlines = body.count("\n") + 1
-        self.ui.tool_dot("read", self.ui.st.fg(self._rel(p)),
-                         f"{nlines} lines · {human_bytes(len(body))}")
-        return _clip(body)
+            lines = f.read().splitlines()
+        total = len(lines)
+        try:
+            offset = max(1, int(_get(args, "offset", "start", default=1) or 1))
+        except (TypeError, ValueError):
+            offset = 1
+        limit_raw = _get(args, "limit", "count", default=None)
+        try:
+            limit = int(limit_raw) if limit_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            limit = None
+        ranged = offset > 1 or limit is not None
+        limit = DEFAULT_READ_LINES if limit is None else limit
+        limit = max(1, min(limit, MAX_READ_LINES))
+        start, end = offset - 1, min(total, offset - 1 + limit)
+        shown = lines[start:end] if start < total else []
+        width = max(1, len(str(end)))
+        numbered = "\n".join(f"{start + k + 1:>{width}}\t{ln}" for k, ln in enumerate(shown))
+
+        detail = (f"lines {offset}–{end} of {total}" if (ranged or end < total)
+                  else f"{total} lines · {human_bytes(os.path.getsize(p))}")
+        self.ui.tool_dot("read", self.ui.st.fg(self._rel(p)), detail)
+        if total == 0:
+            return "(empty file)"
+        if start >= total:
+            return f"[offset {offset} is past the end of the file ({total} lines)]"
+        note = (f"\n... [showing lines {offset}-{end} of {total}; "
+                f"read further with offset={end + 1}]" if end < total else "")
+        return _clip(numbered + note, MAX_READ_OUTPUT)
 
     def list_dir(self, args):
         p = self._resolve(_get(args, "path", default="."))
@@ -1152,7 +1309,99 @@ class ToolBox:
         self.ui.listing_block(pretty)
         return _clip("\n".join(pretty) or "(empty)")
 
+    def search_code(self, args):
+        pattern = _get(args, "pattern", "query", "q")
+        pattern = str(pattern) if pattern not in (None, "") else ""
+        if not pattern:
+            self.ui.tool_dot("search", self.ui.st.dim("(no pattern)"))
+            return "error: empty search pattern"
+        root = self._resolve(_get(args, "path", default="."))
+        regex_val = _get(args, "regex", default=None)
+        as_regex = True if regex_val is None else _as_bool(regex_val, default=True)
+        ignore_case = _as_bool(_get(args, "ignore_case", "i", default=False))
+        globpat = _get(args, "glob", "include", default="") or ""
+        try:
+            rx = re.compile(pattern if as_regex else re.escape(pattern),
+                            re.IGNORECASE if ignore_case else 0)
+        except re.error as e:
+            self.ui.tool_dot("search", self.ui.st.fg(str(pattern), b=True), "bad regex")
+            return f"error: invalid regex {pattern!r}: {e}"
+
+        hits, files_with_hits, truncated = [], 0, False
+        for fp in _iter_files(root):
+            if globpat and not fnmatch.fnmatch(os.path.basename(fp), globpat):
+                continue
+            lines = _read_text_lines(fp)
+            if lines is None:
+                continue
+            rel, file_hit = self._rel(fp), False
+            for lineno, line in enumerate(lines, 1):
+                if rx.search(line):
+                    hits.append(f"{rel}:{lineno}: {line.strip()[:200]}")
+                    file_hit = True
+                    if len(hits) >= SEARCH_MAX_RESULTS:
+                        truncated = True
+                        break
+            files_with_hits += file_hit
+            if truncated:
+                break
+
+        metric = (f"{len(hits)} hit{'s' if len(hits) != 1 else ''} · "
+                  f"{files_with_hits} file{'s' if files_with_hits != 1 else ''}")
+        self.ui.tool_dot("search", self.ui.st.fg(str(pattern), b=True), metric)
+        if not hits:
+            return (f"no matches for {pattern!r}"
+                    + (f" in files matching {globpat!r}" if globpat else ""))
+        self.ui.listing_block(hits, cap=12)
+        out = "\n".join(hits)
+        if truncated:
+            out += f"\n... [stopped at {SEARCH_MAX_RESULTS} matches; narrow the pattern or pass a glob]"
+        return _clip(out)
+
+    def find_files(self, args):
+        pattern = _get(args, "pattern", "name", "glob", "query")
+        pattern = str(pattern) if pattern not in (None, "") else ""
+        if not pattern:
+            self.ui.tool_dot("find", self.ui.st.dim("(no pattern)"))
+            return "error: empty filename pattern"
+        root = self._resolve(_get(args, "path", default="."))
+        has_glob = any(ch in pattern for ch in "*?[")
+        matches, truncated = [], False
+        for fp in _iter_files(root):
+            base = os.path.basename(fp)
+            hit = fnmatch.fnmatch(base, pattern) if has_glob else pattern.lower() in base.lower()
+            if hit:
+                matches.append(self._rel(fp))
+                if len(matches) >= FIND_MAX_RESULTS:
+                    truncated = True
+                    break
+        matches.sort()
+        self.ui.tool_dot("find", self.ui.st.fg(str(pattern), b=True),
+                         f"{len(matches)} file{'s' if len(matches) != 1 else ''}"
+                         + (" +" if truncated else ""))
+        if not matches:
+            return f"no files matching {pattern!r} under {self._rel(root) or '.'}"
+        self.ui.listing_block(matches, cap=20)
+        out = "\n".join(matches)
+        if truncated:
+            out += f"\n... [stopped at {FIND_MAX_RESULTS} files]"
+        return _clip(out)
+
     # ---- mutating (confirmation unless --auto) -----------------------
+    def _post_write_check(self, p, content):
+        """Syntax-gate a file that was just saved: show the result in the UI and
+        append it to the tool reply so the model reacts on its very next turn."""
+        chk = _syntax_check(p, content)
+        if chk is None:
+            return ""
+        ok, msg = chk
+        if ok:
+            self.ui.note(msg)
+            return f" ({msg})"
+        self.ui.error(msg)
+        return (f"\nWARNING: the file was saved but is broken — {msg}. "
+                "Fix it now, before doing anything else.")
+
     def _approved(self, question):
         if self.auto:
             return True
@@ -1178,21 +1427,52 @@ class ToolBox:
             f.write(content)
         self.edits += 1
         self.ui.ok(f"wrote {self._rel(p)}")
-        return f"ok: wrote {self._rel(p)} ({len(content)} bytes)"
+        return f"ok: wrote {self._rel(p)} ({len(content)} bytes)" + self._post_write_check(p, content)
+
+    @staticmethod
+    def _strip_line_numbers(text):
+        """If EVERY non-blank line of `text` is prefixed 'N\\t' (a read_file paste),
+        return it with those prefixes removed; otherwise None. Lets an edit whose
+        'find' was copied straight out of read_file still land."""
+        lines = text.split("\n")
+        pat = re.compile(r"^\s*\d+\t")
+        real = [ln for ln in lines if ln.strip()]
+        if real and all(pat.match(ln) for ln in real):
+            return "\n".join(pat.sub("", ln) for ln in lines)
+        return None
+
+    @staticmethod
+    def _near_miss(body, find):
+        """A short hint at the closest existing line to a 'find' that wasn't present."""
+        head = next((ln for ln in (find or "").splitlines() if ln.strip()), "")[:80]
+        if not head:
+            return ""
+        best = difflib.get_close_matches(head, body.splitlines(), n=1, cutoff=0.5)
+        return f" Closest line in the file: {best[0].strip()[:120]!r}" if best else ""
 
     def edit_file(self, args):
         p = self._resolve(_get(args, "path"))
         find = _get(args, "find", "old", "old_string")
         repl = _get(args, "replace", "new", "new_string")
+        replace_all = _as_bool(_get(args, "replace_all", "all", "global", default=False))
         if not os.path.isfile(p):
             self.ui.tool_dot("edit", self.ui.st.fg(self._rel(p)), "no such file")
             return f"error: no such file: {self._rel(p)}"
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             body = f.read()
-        n = body.count(find)
+        n = body.count(find) if find else 0
+        if find and n == 0:                       # tolerate a line-numbered paste
+            stripped = self._strip_line_numbers(find)
+            if stripped and body.count(stripped) > 0:
+                find, n = stripped, body.count(stripped)
         if not find or n == 0:
             self.ui.tool_dot("edit", self.ui.st.fg(self._rel(p)), "text not found")
-            return "error: 'find' text not present in file; read it first, then retry with an exact match"
+            return ("error: 'find' text not present in file; read it first, then retry with "
+                    "an exact match." + self._near_miss(body, find))
+        if n > 1 and not replace_all:
+            self.ui.tool_dot("edit", self.ui.st.fg(self._rel(p)), f"{n} matches — ambiguous")
+            return (f"error: 'find' matches {n} times in {self._rel(p)} — it must be unique. "
+                    "Add surrounding context to target one occurrence, or pass replace_all=true.")
         after = body.replace(find, repl)
         self.ui.tool_dot("edit", self.ui.st.fg(self._rel(p)),
                          f"{n} replacement{'s' if n != 1 else ''}")
@@ -1204,7 +1484,7 @@ class ToolBox:
             f.write(after)
         self.edits += 1
         self.ui.ok(f"edited {self._rel(p)}")
-        return f"ok: replaced {n} occurrence(s) in {self._rel(p)}"
+        return f"ok: replaced {n} occurrence(s) in {self._rel(p)}" + self._post_write_check(p, after)
 
     def run_shell(self, args):
         cmd = _get(args, "command", "cmd")
@@ -1231,20 +1511,52 @@ class ToolBox:
 # --------------------------------------------------------------------------
 # System prompts
 # --------------------------------------------------------------------------
+def _slurm_context():
+    """Short description of the Slurm allocation we are inside ('' outside one)."""
+    job = os.environ.get("SLURM_JOB_ID")
+    if not job:
+        return ""
+    bits = [f"Slurm job {job}"]
+    part = os.environ.get("SLURM_JOB_PARTITION")
+    if part:
+        bits.append(f"partition {part}")
+    cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if cpus:
+        bits.append(f"{cpus} CPU cores")
+    gpus = pretty_gpus(os.environ.get("GOAT_GPUS", ""))
+    if gpus:
+        bits.append(gpus)
+    return ", ".join(bits)
+
+
 def system_prompt(model, node, cwd):
+    alloc = _slurm_context()
+    where = (f"inside a Slurm allocation ({alloc}) on compute node '{node}'"
+             if alloc else f"on node '{node}'")
     return (
         "You are Engaging Coder, an expert software engineer working directly inside a "
         "user's project on the MIT Engaging HPC cluster. "
-        f"You are the model '{model}', running locally on GPU node '{node}'. "
+        f"You are the model '{model}', running locally {where}. "
         f"The working directory is '{cwd}'.\n\n"
-        "You have tools: read_file, list_dir, write_file, edit_file, run_shell. "
-        "Use them to inspect the project before changing it. Prefer edit_file for small, "
-        "targeted changes and write_file for new files. Use run_shell to build, test, or "
-        "explore (it runs on the cluster GPU node). File edits and shell commands are shown "
-        "to the user for approval, so act decisively and explain what you are doing.\n\n"
+        "Your tools: search_code (regex search across the project), find_files (locate files "
+        "by name), read_file (with offset/limit paging for big files), list_dir, write_file, "
+        "edit_file, run_shell (executes on this node inside this job's CPU/RAM limits — "
+        "build and test here, but submit separate heavy or long-running work with sbatch).\n\n"
+        "Work like a careful engineer: SEARCH and READ to understand the code before you "
+        "change it — never fabricate file contents, APIs, or command output. Prefer edit_file "
+        "for small, targeted changes and write_file for new files. read_file shows line "
+        "numbers for reference only — never copy them into edit_file, and remember edit_file "
+        "needs its 'find' text to be unique (quote enough surrounding context) unless you pass "
+        "replace_all=true.\n\n"
+        "VERIFY, DON'T ASSERT: after changing code, prove it works with run_shell — run the "
+        "test suite, the script itself, or at least a compile/import — and read the exit code "
+        "and output before drawing conclusions. Files you write are syntax-checked "
+        "automatically; if a WARNING comes back, fix it before anything else. Never claim "
+        "code works, compiles, or passes tests unless you ran it here and saw it succeed; if "
+        "something was not verified, say so explicitly. File edits and shell commands are "
+        "shown to the user for approval, so act decisively and explain what you are doing.\n\n"
         "Be concise. Format replies as markdown; put code in fenced blocks with a language "
-        "tag. When a task is done, give a short summary of what changed. "
-        "Do not fabricate file contents or command output -- always read or run to find out."
+        "tag. When a task is done, summarize what changed and how it was verified."
     )
 
 
@@ -1572,7 +1884,93 @@ def selftest():
                   ("edit content applied", r4), ("edit_file missing text", r5),
                   ("list_dir", r6), ("run_shell", r7), ("read missing", r8)]:
         check(nm, r)
+
+    # search_code / find_files / ranged read / smart edit
+    buf = io.StringIO()
+    sys.stdout = buf
+    try:
+        ui = UI(st)
+        tb = ToolBox(ui, d, auto=True)
+        tb.write_file({"path": "pkg/mod.py",
+                       "content": "def alpha():\n    return 1\n\ndef beta():\n    return alpha()\n"})
+        tb.write_file({"path": "pkg/util.py", "content": "X = 1\nY = 2\nX = 3\nZ = X\n"})
+        tb.write_file({"path": "node_modules/lib.py", "content": "import x\n"})  # heavy dir
+        s_hits = tb.search_code({"pattern": r"def \w+"})
+        s_glob = tb.search_code({"pattern": "alpha", "glob": "*.py"})
+        s_none = tb.search_code({"pattern": "zzzznope"})
+        s_lit = tb.search_code({"pattern": "alpha()", "regex": False})
+        f_glob = tb.find_files({"pattern": "*.py"})
+        f_sub = tb.find_files({"pattern": "util"})
+        rng = tb.read_file({"path": "pkg/mod.py", "offset": 4, "limit": 1})
+        numbered = tb.read_file({"path": "pkg/util.py"})
+        amb = tb.edit_file({"path": "pkg/util.py", "find": "X = ", "replace": "Z = "})
+        uniq = tb.edit_file({"path": "pkg/mod.py", "find": "return 1", "replace": "return 2"})
+        allrep = tb.edit_file({"path": "pkg/util.py", "find": "X", "replace": "W", "replace_all": True})
+        miss = tb.edit_file({"path": "pkg/mod.py", "find": "def alfa():", "replace": "x"})
+        lnpaste = tb.edit_file({"path": "pkg/mod.py", "find": "1\tdef alpha():", "replace": "def gamma():"})
+        mod_after = open(os.path.join(d, "pkg", "mod.py")).read()
+    finally:
+        sys.stdout = old
+    check("search_code regex", "pkg/mod.py:1:" in s_hits and "pkg/mod.py:4:" in s_hits)
+    check("search_code glob filter", "alpha" in s_glob and "util.py" not in s_glob)
+    check("search_code no match", "no matches" in s_none)
+    check("search_code literal", "pkg/mod.py:5:" in s_lit)
+    check("find_files glob", "pkg/mod.py" in f_glob and "pkg/util.py" in f_glob)
+    check("find_files substring", "pkg/util.py" in f_sub and "mod.py" not in f_sub)
+    check("search/find skip heavy dirs", "node_modules" not in f_glob)
+    check("read_file range", "4\tdef beta():" in rng and "alpha" not in rng)
+    check("read_file numbered", "1\tX = 1" in numbered)
+    check("edit ambiguous refused", "must be unique" in amb and "2 times" in amb)
+    check("edit unique applied", "ok:" in uniq)
+    check("edit replace_all", "ok:" in allrep and "3 occurrence" in allrep)
+    check("edit near-miss hint", "Closest line" in miss)
+    check("edit tolerates pasted line numbers", "ok:" in lnpaste and "def gamma():" in mod_after)
     shutil.rmtree(d, ignore_errors=True)
+
+    # post-write syntax verification (the mechanical anti-BS gate)
+    d2 = tempfile.mkdtemp(prefix="engaging-coder-verify-")
+    buf = io.StringIO()
+    sys.stdout = buf
+    try:
+        ui = UI(st)
+        tb = ToolBox(ui, d2, auto=True)
+        good_py = tb.write_file({"path": "ok.py", "content": "def f():\n    return 1\n"})
+        bad_py = tb.write_file({"path": "bad.py", "content": "def f(:\n    pass\n"})
+        bad_json = tb.write_file({"path": "cfg.json", "content": "{not json}"})
+        broke = tb.edit_file({"path": "ok.py", "find": "return 1", "replace": "return ("})
+        bad_kept = os.path.isfile(os.path.join(d2, "bad.py"))
+        if shutil.which("bash"):
+            good_sh = tb.write_file({"path": "run.sh", "content": "echo hi\n"})
+            bad_sh = tb.write_file({"path": "boom.sh", "content": "if true; then\n"})
+        else:  # no bash on this node: checker opts out, nothing to assert
+            good_sh, bad_sh = "bash syntax OK", "WARNING bash syntax error"
+    finally:
+        sys.stdout = old
+    check("write .py syntax ok noted", "python syntax OK" in good_py)
+    check("write .py syntax error flagged", "WARNING" in bad_py and "syntax error" in bad_py)
+    check("flagged file still saved", bad_kept)
+    check("write .json invalid flagged", "invalid JSON" in bad_json)
+    check("edit that breaks syntax flagged", "WARNING" in broke)
+    check("write .sh syntax ok noted", "bash syntax OK" in good_sh)
+    check("write .sh syntax error flagged", "bash syntax error" in bad_sh)
+    shutil.rmtree(d2, ignore_errors=True)
+
+    # system prompt: names the real allocation + mandates verification
+    saved_env = {k: os.environ.get(k) for k in
+                 ("SLURM_JOB_ID", "SLURM_JOB_PARTITION", "SLURM_CPUS_PER_TASK", "GOAT_GPUS")}
+    try:
+        os.environ.update({"SLURM_JOB_ID": "42", "SLURM_JOB_PARTITION": "mit_normal",
+                           "SLURM_CPUS_PER_TASK": "16", "GOAT_GPUS": "h200:2"})
+        sp = system_prompt("m", "node1", "/tmp")
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("system prompt names the allocation",
+          "Slurm job 42" in sp and "mit_normal" in sp and "2× H200" in sp)
+    check("system prompt mandates verification", "VERIFY, DON'T ASSERT" in sp)
 
     check("pretty_gpus", pretty_gpus("h200:3") == "3× H200" and pretty_gpus("1") == "")
     print("\n  " + ("ALL PASSED" if ok else "FAILURES ABOVE"))
@@ -1594,6 +1992,11 @@ def demo():
     md.feed("I'll look at the loader first, then make a **surgical fix**.\n\n")
     md.close()
 
+    ui.tool_dot("find", st.fg("config.py", b=True), "1 file")
+    ui.listing_block(["src/config.py"])
+    ui.tool_dot("search", st.fg(r"def (load|save)", b=True), "2 hits · 1 file")
+    ui.listing_block(["src/config.py:3: def load(path):",
+                      "src/config.py:6: def save(path, data):"], cap=12)
     ui.tool_dot("read", st.fg("src/config.py"), "58 lines · 1.8 KB")
     ui.tool_dot("list", st.fg("src"), "4 entries")
     ui.listing_block(["__init__.py", "config.py", "parser.py", "tests/"])

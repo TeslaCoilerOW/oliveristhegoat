@@ -152,7 +152,8 @@ interface:
 › refactor the parser and run the tests
 
 ● qwen3-coder:480b
-I'll read the parser, make the change, and run pytest.
+I'll find the parser, make the change, and run pytest.
+  ⚙ search def parse           2 hits · 1 file
   ⚙ edit  src/parser.py
   ✓ - def parse(s): ...
     + def parse(s: str) -> AST: ...   (1x)
@@ -162,11 +163,23 @@ I'll read the parser, make the change, and run pytest.
 Done — tightened the parser and all tests pass.
 ```
 
-The model can **read, write, and edit** your files and **run shell commands on
-the GPU node** — every edit and command asks for your approval (toggle with
-`/auto`). It streams replies, shows a thinking spinner, and supports slash
-commands (`/help`, `/add <file>`, `/run <cmd>`, `/auto`, `/clear`, `/exit`).
-Exit to free the GPUs.
+The model can **search and read** your code, **write and edit** files, and **run
+shell commands on the GPU node**: it greps the whole project with `search_code`,
+locates files by name with `find_files`, pages through large files, and makes
+**unique-by-default edits** (an edit that would hit several places is refused
+until you scope it or pass `replace_all`). Every edit and command asks for your
+approval (toggle with `/auto`). It streams replies, shows a thinking spinner,
+and supports slash commands (`/help`, `/add <file>`, `/run <cmd>`, `/auto`,
+`/clear`, `/exit`). Exit to free the GPUs.
+
+> **Verified, not vibes.** Every file the agent writes or edits is
+> syntax-checked on the spot (Python compile, `bash -n`, JSON parse) and any
+> failure is pushed straight back into the model's next turn to fix. The
+> system prompt hard-requires the model to *run* its work — tests, the script
+> itself, at least a compile/import — and read the exit code before claiming
+> success, and to say explicitly when something wasn't verified. It is also
+> told exactly which Slurm allocation it is inside (job, partition, cores,
+> GPUs), so cluster-side commands and advice are grounded, not guessed.
 
 > **Zero install** — Engaging Coder is pure-Python (stdlib only). Prefer a
 > different front-end? `CODER=aider ollama-code` uses [aider](https://aider.chat)
@@ -227,6 +240,7 @@ for one run (emergency bypass). To ship a new version: commit, bump
 | `GOAT_WINDOW_CPU=` | allocation window for CPU jobs (s) | default `90` |
 | `GOAT_PART_CPU=` | quick-mode partitions, asked all at once (first to grant wins) | default `mit_normal,mit_quicktest,mit_preemptable` |
 | `CODER=` | coding front-end (`engaging`/`aider`/any) | `CODER=aider ollama-code` |
+| `GOAT_RUN_TIMEOUT=` | seconds before the coder kills a shell command it ran | default `180` |
 | `GOAT_UPDATE=0` | skip the GitHub self-update check this run | `GOAT_UPDATE=0 oliveristhegoat …` |
 | `GOAT_UPDATE_TIMEOUT=` | seconds allowed for the update check | default `5` |
 | `GOAT_ETA_WAIT=` | when nothing is free, auto-queue if Slurm forecasts a start within this many seconds (`0` = always fail fast) | default `120` |
